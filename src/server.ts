@@ -71,10 +71,21 @@ const forwardRequest = async (
 ): Promise<Response> => {
   const url = new URL(req.url);
   url.port = String(config.port);
-  if (!config.keepHostname) url.hostname = "localhost";
+  const headers = new Headers(req.headers);
+  if (!config.keepHostname) {
+    url.hostname = "localhost";
+    if (req.headers.has("Host")) headers.set("Host", "localhost");
+    if (req.headers.has("Origin"))
+      headers.set("Origin", url.protocol + "//localhost");
+  }
 
   try {
-    return await fetch(new Request(url, req));
+    return await fetch(url, {
+      method: req.method,
+      headers,
+      body: req.body,
+      duplex: "half",
+    });
   } catch (err) {
     console.error("Failed to forward to port", config.port, err);
     return Response.json(
