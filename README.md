@@ -31,7 +31,7 @@ In another terminal, add a second service at `web.localhost`; it registers with
 the already-running master automatically:
 
 ```sh
-localman web npm run dev
+localman web npm run dev --port \$PORT
 ```
 
 Now `http://api.localhost/` and `http://web.localhost/` both reach their
