@@ -1,3 +1,5 @@
+import { orange } from "./color.ts";
+
 /** Routing entry for a registered host: the local port to forward to. */
 export type HostConfig = {
   /** Local port the target service is listening on. */
@@ -122,14 +124,14 @@ const handleRegister = async (
     );
 
   state.hosts.set(host, { port, keepHostname });
-  console.debug(`Registered host   \x1b[33m${host}\x1b[0m to port`, port);
+  console.debug(`Registered host   ${orange(host)} to port`, port);
   return new Response(null, { status: 204 });
 };
 
 /** Handles `DELETE /hosts/:host` — removes a host mapping (idempotent). */
 const handleUnregister = (host: string, state: HandlerState): Response => {
   state.hosts.delete(host);
-  console.debug(`Deregistered host \x1b[33m${host}\x1b[0m`);
+  console.debug(`Deregistered host ${orange(host)}`);
   return new Response(null, { status: 204 });
 };
 
