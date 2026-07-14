@@ -64,6 +64,113 @@ const withRetry = async <T>(
   }
 };
 
+const forwardWebsocket = (req: Request, url: URL): Response => {
+  let upstream: WebSocket;
+  try {
+    upstream = new WebSocket(url, { headers: req.headers });
+  } catch (err) {
+    console.error("WebSocket | Failed to connect upstream", err);
+
+    queueMicrotask(() => {
+      try {
+        client.close(1011, "Failed to connect upstream");
+      } catch {
+        // Ignore
+      }
+    });
+
+    return Response.json(
+      { message: "Failed to proxy websocket" },
+      { status: 500 },
+    );
+  }
+
+  const { socket: client, response } = Deno.upgradeWebSocket(req);
+
+  let closed = false;
+
+  const clientQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] = [];
+  const upstreamQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] =
+    [];
+
+  const isOpen = (ws: WebSocket) => ws.readyState === WebSocket.OPEN;
+
+  const flush = (queue: typeof clientQueue, target: WebSocket) => {
+    while (queue.length && isOpen(target)) {
+      target.send(queue.shift()!);
+    }
+  };
+
+  const closeBoth = (code = 1000, reason?: string) => {
+    if (closed) return;
+    closed = true;
+
+    if (
+      client.readyState === WebSocket.OPEN ||
+      client.readyState === WebSocket.CONNECTING
+    ) {
+      try {
+        client.close(code, reason);
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (
+      upstream.readyState === WebSocket.OPEN ||
+      upstream.readyState === WebSocket.CONNECTING
+    ) {
+      try {
+        upstream.close(code, reason);
+      } catch {
+        // Ignore
+      }
+    }
+  };
+
+  client.onopen = () => {
+    flush(upstreamQueue, client);
+  };
+
+  upstream.onopen = () => {
+    flush(clientQueue, upstream);
+  };
+
+  client.onmessage = ({ data }) => {
+    if (closed) return;
+
+    if (isOpen(upstream)) upstream.send(data);
+    else if (upstream.readyState === WebSocket.CONNECTING)
+      clientQueue.push(data);
+  };
+
+  upstream.onmessage = ({ data }) => {
+    if (closed) return;
+
+    if (isOpen(client)) client.send(data);
+    else if (client.readyState === WebSocket.CONNECTING)
+      upstreamQueue.push(data);
+  };
+
+  client.onclose = ({ code, reason }) => {
+    closeBoth(code, reason);
+  };
+
+  upstream.onclose = ({ code, reason }) => {
+    closeBoth(code, reason);
+  };
+
+  client.onerror = (err) => {
+    console.error("WebSocket | Client error", err);
+  };
+
+  upstream.onerror = (err) => {
+    console.error("WebSocket | Upstream error", err);
+  };
+
+  return response;
+};
+
 /** Forwards a proxied request to the local port named by `config`. */
 const forwardRequest = async (
   req: Request,
@@ -78,6 +185,12 @@ const forwardRequest = async (
     if (req.headers.has("Origin"))
       headers.set("Origin", url.protocol + "//localhost");
   }
+
+  if (
+    req.headers.get("connection")?.toLowerCase()?.includes("upgrade") &&
+    req.headers.get("upgrade")?.toLowerCase() === "websocket"
+  )
+    return forwardWebsocket(req, url);
 
   try {
     return await fetch(url, {
