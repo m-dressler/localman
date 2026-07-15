@@ -9,10 +9,8 @@ free port, and requests to `<host>.localhost` are forwarded there.
 
 ## Install
 
-Update your shell config such as `~/.zshrc` to add Localman:
-
 ```sh
-alias localman `deno run -A jsr:@md/localman`
+deno i --global -A jsr:@md/localman
 ```
 
 ## Usage
