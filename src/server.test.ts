@@ -165,6 +165,118 @@ Deno.test("client: registers with the master over HTTP", async () => {
 });
 
 Deno.test(
+  "websocket: an unreachable upstream is reported as a concise error",
+  // WebSocket teardown leaves background ops/connections in flight.
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    // The upstream answers 200 instead of upgrading, so the proxy's upstream
+    // socket fails before it ever opens — a genuine misconfiguration.
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      handler: () => new Response(null, { status: 200 }),
+    });
+    const server = createServer({ port });
+
+    const errors: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args);
+    };
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      await new Promise<void>((resolve) => {
+        const ws = new WebSocket(`ws://svc.localhost:${port}/`);
+        ws.onerror = () => {};
+        ws.onclose = () => resolve();
+        setTimeout(resolve, 3000);
+      });
+      // Let the upstream error and close settle.
+      await new Promise((r) => setTimeout(r, 100));
+    } finally {
+      console.error = originalError;
+      await server.close();
+      await upstream.shutdown();
+    }
+
+    const upstreamErrors = errors.filter((args) =>
+      String(args[0]).toLowerCase().includes("upstream"),
+    );
+    assertEquals(upstreamErrors.length, 1);
+    // Concise: a reason string, not a dumped ErrorEvent object.
+    assertEquals(typeof upstreamErrors[0][1], "string");
+  },
+);
+
+Deno.test(
+  "websocket: a client that drops abruptly is not logged as an error",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      handler: (req) => {
+        if (req.headers.get("upgrade") === "websocket") {
+          const { socket, response } = Deno.upgradeWebSocket(req);
+          socket.onmessage = (e) => socket.send(e.data);
+          return response;
+        }
+        return new Response("no ws");
+      },
+    });
+    const server = createServer({ port });
+
+    const errors: unknown[][] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => {
+      errors.push(args);
+    };
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+
+      // Perform the WebSocket handshake by hand, then drop the TCP connection
+      // without a close frame — exactly how a navigating browser vanishes.
+      const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+      const key = btoa(
+        String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
+      );
+      const handshake =
+        `GET /?token=abc HTTP/1.1\r\n` +
+        `Host: svc.localhost:${port}\r\n` +
+        `Upgrade: websocket\r\n` +
+        `Connection: Upgrade\r\n` +
+        `Sec-WebSocket-Key: ${key}\r\n` +
+        `Sec-WebSocket-Version: 13\r\n\r\n`;
+      await conn.write(new TextEncoder().encode(handshake));
+      await conn.read(new Uint8Array(1024)); // consume the 101 response
+      conn.close(); // abrupt drop, no close frame
+
+      // Give the proxy time to observe the EOF.
+      await new Promise((r) => setTimeout(r, 300));
+    } finally {
+      console.error = originalError;
+      await server.close();
+      await upstream.shutdown();
+    }
+
+    const clientErrors = errors.filter((args) =>
+      String(args[0]).toLowerCase().includes("client"),
+    );
+    assertEquals(clientErrors.length, 0);
+  },
+);
+
+Deno.test(
   "failover: a client is promoted and the table is rebuilt when the master exits",
   // The failover path involves background watch loops and long-poll
   // connections whose teardown races with the test's own completion.

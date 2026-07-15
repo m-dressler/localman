@@ -64,6 +64,10 @@ const withRetry = async <T>(
   }
 };
 
+/** Concise, human-readable reason from a WebSocket error event. */
+const errorReason = (event: Event): string =>
+  event instanceof ErrorEvent ? event.message : event.type;
+
 const forwardWebsocket = (req: Request, url: URL): Response => {
   let upstream: WebSocket;
   try {
@@ -88,6 +92,7 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
   const { socket: client, response } = Deno.upgradeWebSocket(req);
 
   let closed = false;
+  let upstreamOpened = false;
 
   const clientQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] = [];
   const upstreamQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] =
@@ -133,6 +138,7 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
   };
 
   upstream.onopen = () => {
+    upstreamOpened = true;
     flush(clientQueue, upstream);
   };
 
@@ -160,12 +166,25 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
     closeBoth(code, reason);
   };
 
-  client.onerror = (err) => {
-    console.error("WebSocket | Client error", err);
+  client.onerror = (event) => {
+    // Browsers and HMR sockets routinely drop without a close handshake, which
+    // surfaces here as an error (e.g. "Unexpected EOF"). It needs no action —
+    // the paired onclose tears the other side down — so keep it out of the way.
+    console.debug("WebSocket | Client disconnected", errorReason(event));
   };
 
-  upstream.onerror = (err) => {
-    console.error("WebSocket | Upstream error", err);
+  upstream.onerror = (event) => {
+    // A drop once the upstream has opened, or once teardown is already under
+    // way, is an expected lifecycle event. A failure before it ever opened
+    // means the upstream refused or could not complete the handshake — a
+    // genuine (often misconfigured-port) problem worth surfacing.
+    if (closed || upstreamOpened)
+      console.debug("WebSocket | Upstream disconnected", errorReason(event));
+    else
+      console.error(
+        "WebSocket | Upstream connection failed",
+        errorReason(event),
+      );
   };
 
   return response;
