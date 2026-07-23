@@ -48,7 +48,7 @@ if (import.meta.main) {
   else console.debug = console.debug.bind(console, "$ localman:");
 
   const server = createServer();
-  const { process, port } = runCommand(command, ...args);
+  const { process, port } = runCommand([command, ...args]);
 
   let shuttingDown = false;
   const shutdown = async () => {

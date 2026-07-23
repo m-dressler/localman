@@ -8,22 +8,17 @@ import { orange } from "./color.ts";
  * @returns The spawned child process and the port it was told to use.
  */
 export const runCommand = (
-  command: string,
-  ...args: string[]
+  command: [string, ...string[]],
 ): { process: Deno.ChildProcess; port: number } => {
+  const [cmd, ...args] = command;
   const port = Number(Deno.env.get("PORT")) || getAvailablePort();
 
   const portIndex = args.indexOf("$PORT");
-  if (portIndex !== -1)
-    args = [
-      ...args.slice(0, portIndex),
-      port + "",
-      ...args.slice(portIndex + 1),
-    ];
+  if (portIndex !== -1) args.splice(portIndex, 1, port + "");
 
-  console.debug("Running command", orange(command), args);
+  console.debug("Running command", orange(cmd), args);
 
-  const process = new Deno.Command(command, {
+  const process = new Deno.Command(cmd, {
     args,
     env: { PORT: port + "" },
   }).spawn();
