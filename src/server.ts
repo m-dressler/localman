@@ -54,7 +54,7 @@ const withRetry = async <T>(
   attempts = 5,
   delayMs = 50,
 ): Promise<T> => {
-  for (let attempt = 1; ; attempt++) {
+  for (let attempt = 1;; attempt++) {
     try {
       return await fn();
     } catch (err) {
@@ -146,16 +146,18 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
     if (closed) return;
 
     if (isOpen(upstream)) upstream.send(data);
-    else if (upstream.readyState === WebSocket.CONNECTING)
+    else if (upstream.readyState === WebSocket.CONNECTING) {
       clientQueue.push(data);
+    }
   };
 
   upstream.onmessage = ({ data }) => {
     if (closed) return;
 
     if (isOpen(client)) client.send(data);
-    else if (client.readyState === WebSocket.CONNECTING)
+    else if (client.readyState === WebSocket.CONNECTING) {
       upstreamQueue.push(data);
+    }
   };
 
   client.onclose = ({ code, reason }) => {
@@ -178,13 +180,14 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
     // way, is an expected lifecycle event. A failure before it ever opened
     // means the upstream refused or could not complete the handshake — a
     // genuine (often misconfigured-port) problem worth surfacing.
-    if (closed || upstreamOpened)
+    if (closed || upstreamOpened) {
       console.debug("WebSocket | Upstream disconnected", errorReason(event));
-    else
+    } else {
       console.error(
         "WebSocket | Upstream connection failed",
         errorReason(event),
       );
+    }
   };
 
   return response;
@@ -201,15 +204,17 @@ const forwardRequest = async (
   if (!config.keepHostname) {
     url.hostname = "localhost";
     if (req.headers.has("Host")) headers.set("Host", "localhost");
-    if (req.headers.has("Origin"))
+    if (req.headers.has("Origin")) {
       headers.set("Origin", url.protocol + "//localhost");
+    }
   }
 
   if (
     req.headers.get("connection")?.toLowerCase()?.includes("upgrade") &&
     req.headers.get("upgrade")?.toLowerCase() === "websocket"
-  )
+  ) {
     return forwardWebsocket(req, url);
+  }
 
   try {
     return await fetch(url, {
@@ -233,11 +238,12 @@ const handleRegister = async (
   host: string,
   state: HandlerState,
 ): Promise<Response> => {
-  if (!req.headers.get("Content-Type")?.includes("application/json"))
+  if (!req.headers.get("Content-Type")?.includes("application/json")) {
     return Response.json(
       { message: "Content-Type must be application/json" },
       { status: 400 },
     );
+  }
 
   let body: Record<string, unknown>;
   try {
@@ -251,7 +257,7 @@ const handleRegister = async (
   }
 
   const { port, keepHostname = false } = body;
-  if (typeof port !== "number" || typeof keepHostname !== "boolean")
+  if (typeof port !== "number" || typeof keepHostname !== "boolean") {
     return Response.json(
       {
         message:
@@ -259,12 +265,14 @@ const handleRegister = async (
       },
       { status: 400 },
     );
+  }
 
-  if (state.hosts.get(host))
+  if (state.hosts.get(host)) {
     return Response.json(
       { message: "Host is already bound`" },
       { status: 400 },
     );
+  }
 
   state.hosts.set(host, { port, keepHostname });
   console.debug(`Registered host   ${orange(host)} to port`, port);
@@ -305,18 +313,21 @@ const handleRoot = (req: Request, state: HandlerState): Response => {
   const acceptPreference = (contentType: string) =>
     acceptContent.indexOf(contentType) + 1 || Number.MAX_SAFE_INTEGER;
 
-  if (acceptPreference("text/html") < acceptPreference("application/json"))
+  if (acceptPreference("text/html") < acceptPreference("application/json")) {
     return new Response(
-      `<table><thead><tr><th>Host</th><th>Port</th></tr></thead><tbody>${Array.from(
-        state.hosts.entries(),
-      )
-        .map(
-          ([host, config]) =>
-            `<tr><td><a href="http://${host}.localhost/">${host}</a></td><td>${config.port}</td></tr>`,
+      `<table><thead><tr><th>Host</th><th>Port</th></tr></thead><tbody>${
+        Array.from(
+          state.hosts.entries(),
         )
-        .join("")}</tbody></table>`,
+          .map(
+            ([host, config]) =>
+              `<tr><td><a href="http://${host}.localhost/">${host}</a></td><td>${config.port}</td></tr>`,
+          )
+          .join("")
+      }</tbody></table>`,
       { headers: { "Content-Type": "text/html" } },
     );
+  }
   return Response.json(Object.fromEntries(state.hosts.entries()));
 };
 
@@ -336,10 +347,12 @@ const handleLocalmanRequest = (
       { status: 405, headers: { Allow: "POST, DELETE" } },
     );
   }
-  if (url.pathname === "/wait" && req.method === "GET")
+  if (url.pathname === "/wait" && req.method === "GET") {
     return handleWait(state);
-  if (url.pathname === "/" && req.method === "GET")
+  }
+  if (url.pathname === "/" && req.method === "GET") {
     return handleRoot(req, state);
+  }
 
   return Response.json(
     { message: "The requested route doesn't exist" },
@@ -349,11 +362,11 @@ const handleLocalmanRequest = (
 
 /** Builds the master's request handler over the given routing `state`. */
 const createHandler =
-  (state: HandlerState): Deno.ServeHandler<Deno.NetAddr> =>
-  (req) => {
+  (state: HandlerState): Deno.ServeHandler<Deno.NetAddr> => (req) => {
     const url = new URL(req.url);
-    if (url.hostname === "localhost" || url.hostname === "127.0.0.1")
+    if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
       return handleLocalmanRequest(req, url, state);
+    }
 
     const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""));
     if (config) return forwardRequest(req, config);
@@ -421,10 +434,11 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(config),
     });
-    if (!res.ok)
+    if (!res.ok) {
       throw new Error(`Failed to register host (${res.status})`, {
         cause: await res.text(),
       });
+    }
   };
 
   /** Replays every owned host to the (new) master. */
@@ -444,7 +458,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
         pollAbort = new AbortController();
         const res = await fetch(`${origin}/wait`, { signal: pollAbort.signal });
         const reader = res.body?.getReader();
-        if (reader) while (!(await reader.read()).done);
+        if (reader) { while (!(await reader.read()).done); }
       } catch {
         // Poll aborted (close) or connection dropped (master gone).
       }
@@ -484,10 +498,11 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
         const res = await fetch(`${origin}/hosts/${host}`, {
           method: "DELETE",
         });
-        if (!res.ok)
+        if (!res.ok) {
           throw new Error(`Failed to unregister host (${res.status})`, {
             cause: await res.text(),
           });
+        }
       } catch (err) {
         // Best effort: if the master is mid-failover the mapping dies with it.
         console.error("Failed to unregister host", host, err);

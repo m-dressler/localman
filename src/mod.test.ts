@@ -32,7 +32,11 @@ Deno.test("parseArgs: flags after the host belong to the command", () => {
 });
 
 Deno.test("parseArgs: unknown flag throws", () => {
-  assertThrows(() => parseArgs(["--nope", "app", "server"]), Error, "Unknown flag");
+  assertThrows(
+    () => parseArgs(["--nope", "app", "server"]),
+    Error,
+    "Unknown flag",
+  );
 });
 
 Deno.test("parseArgs: missing host throws", () => {
