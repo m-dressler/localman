@@ -1,4 +1,3 @@
-import { getAvailablePort } from "@std/net";
 import { orange } from "./color.ts";
 
 /**
@@ -9,18 +8,22 @@ import { orange } from "./color.ts";
  */
 export const runCommand = (
   command: [string, ...string[]],
-): { process: Deno.ChildProcess; port: number } => {
+  opts?: { env?: Record<string, string> },
+): Deno.ChildProcess => {
   const [cmd, ...args] = command;
-  const port = Number(Deno.env.get("PORT")) || getAvailablePort();
 
-  const portIndex = args.indexOf("$PORT");
-  if (portIndex !== -1) args.splice(portIndex, 1, port + "");
+  // Replace args with env values
+  if (opts?.env) {
+    for (let i = 0; i < args.length; ++i) {
+      const arg = args[i];
+      if (arg[0] !== "$") continue;
+
+      const val = opts.env[arg.substring(1)];
+      if (val) args.splice(i, 1, val);
+    }
+  }
 
   console.debug("Running command", orange(cmd), args);
 
-  const process = new Deno.Command(cmd, {
-    args,
-    env: { PORT: port + "" },
-  }).spawn();
-  return { process, port };
+  return new Deno.Command(cmd, { args, env: opts?.env }).spawn();
 };

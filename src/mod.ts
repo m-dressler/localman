@@ -1,3 +1,4 @@
+import { getAvailablePort } from "@std/net/get-available-port";
 import { runCommand } from "./command.ts";
 import { createServer } from "./server.ts";
 
@@ -48,7 +49,11 @@ if (import.meta.main) {
   else console.debug = console.debug.bind(console, "$ localman:");
 
   const server = createServer();
-  const { process, port } = runCommand([command, ...args]);
+
+  const port = Number(Deno.env.get("PORT")) || getAvailablePort();
+  const process = runCommand([command, ...args], {
+    env: { PORT: port + "", HOST: host + ".localhost" },
+  });
 
   let shuttingDown = false;
   const shutdown = async () => {
