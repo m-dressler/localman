@@ -68,10 +68,15 @@ const withRetry = async <T>(
 const errorReason = (event: Event): string =>
   event instanceof ErrorEvent ? event.message : event.type;
 
-const forwardWebsocket = (req: Request, url: URL): Response => {
+/** Proxies a WebSocket upgrade to `url`, opening the upstream with `headers`. */
+const forwardWebsocket = (
+  req: Request,
+  url: URL,
+  headers: Headers,
+): Response => {
   let upstream: WebSocket;
   try {
-    upstream = new WebSocket(url, { headers: req.headers });
+    upstream = new WebSocket(url, { headers });
   } catch (err) {
     console.error("WebSocket | Failed to connect upstream", err);
 
@@ -193,27 +198,35 @@ const forwardWebsocket = (req: Request, url: URL): Response => {
   return response;
 };
 
-/** Forwards a proxied request to the local port named by `config`. */
+/**
+ * Forwards a proxied request to the local port named by `config`.
+ *
+ * `fetch` and `WebSocket` derive `Host` from the upstream URL, so a same-origin `Origin` is
+ * mapped to that same upstream origin to keep origin checks consistent. The
+ * address the client actually used is passed on as `X-Forwarded-Host`/`-Proto`.
+ */
 const forwardRequest = async (
   req: Request,
   config: HostConfig,
 ): Promise<Response> => {
+  const incoming = new URL(req.url);
   const url = new URL(req.url);
   url.port = String(config.port);
+  if (!config.keepHostname) url.hostname = "localhost";
   const headers = new Headers(req.headers);
-  if (!config.keepHostname) {
-    url.hostname = "localhost";
-    if (req.headers.has("Host")) headers.set("Host", "localhost");
-    if (req.headers.has("Origin")) {
-      headers.set("Origin", url.protocol + "//localhost");
-    }
+  headers.set("X-Forwarded-Host", incoming.host);
+  headers.set("X-Forwarded-Proto", incoming.protocol.slice(0, -1));
+  // Only a same-origin request is mapped to the upstream's origin; a foreign
+  // Origin passes through untouched so cross-site requests stay detectable.
+  if (req.headers.get("Origin") === incoming.origin) {
+    headers.set("Origin", url.origin);
   }
 
   if (
     req.headers.get("connection")?.toLowerCase()?.includes("upgrade") &&
     req.headers.get("upgrade")?.toLowerCase() === "websocket"
   ) {
-    return forwardWebsocket(req, url);
+    return forwardWebsocket(req, url, headers);
   }
 
   try {

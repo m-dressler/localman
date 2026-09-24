@@ -38,6 +38,11 @@ services, and `http://localhost/` lists every registered host.
 Pass `--keep-hostname` to forward the original `<host>.localhost` hostname to
 your service instead of rewriting it to `localhost`.
 
+Either way, a same-origin `Origin` header is rewritten to match the forwarded
+`Host`, so origin checks (e.g. CSRF protection) pass. A foreign `Origin` is left
+untouched. The address the client used is available in `X-Forwarded-Host` and
+`X-Forwarded-Proto`.
+
 > Binding port `80` typically requires elevated privileges.
 
 ## Failover

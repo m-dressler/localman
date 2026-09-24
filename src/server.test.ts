@@ -134,6 +134,156 @@ Deno.test("master: forwards proxied requests to the registered port", async () =
   }
 });
 
+/** Headers relevant to origin checks, as seen by an upstream behind the proxy. */
+type SeenHeaders = {
+  host: string | null;
+  origin: string | null;
+  forwardedHost: string | null;
+  forwardedProto: string | null;
+};
+
+/**
+ * Registers `svc` on a fresh master, POSTs to it through the proxy with the
+ * given `Origin`, and returns the headers the upstream received.
+ */
+const proxyPost = async (
+  keepHostname: boolean,
+  origin: (proxyPort: number) => string,
+): Promise<{ seen: SeenHeaders; port: number; upstreamPort: number }> => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: (req) =>
+      Response.json({
+        host: req.headers.get("Host"),
+        origin: req.headers.get("Origin"),
+        forwardedHost: req.headers.get("X-Forwarded-Host"),
+        forwardedProto: req.headers.get("X-Forwarded-Proto"),
+      }),
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", { port: upstreamPort, keepHostname });
+    const res = await fetch(`http://svc.localhost:${port}/approve`, {
+      method: "POST",
+      headers: { Origin: origin(port) },
+      body: "{}",
+    });
+    return { seen: await res.json(), port, upstreamPort };
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+};
+
+Deno.test("master: a same-origin request keeps Host and Origin consistent", async () => {
+  const { seen, port, upstreamPort } = await proxyPost(
+    false,
+    (port) => `http://svc.localhost:${port}`,
+  );
+  assertEquals(seen, {
+    host: `localhost:${upstreamPort}`,
+    origin: `http://localhost:${upstreamPort}`,
+    forwardedHost: `svc.localhost:${port}`,
+    forwardedProto: "http",
+  });
+});
+
+Deno.test("master: --keep-hostname keeps Host and Origin consistent", async () => {
+  const { seen, port, upstreamPort } = await proxyPost(
+    true,
+    (port) => `http://svc.localhost:${port}`,
+  );
+  assertEquals(seen, {
+    host: `svc.localhost:${upstreamPort}`,
+    origin: `http://svc.localhost:${upstreamPort}`,
+    forwardedHost: `svc.localhost:${port}`,
+    forwardedProto: "http",
+  });
+});
+
+Deno.test("master: a cross-site Origin is forwarded untouched", async () => {
+  for (const keepHostname of [false, true]) {
+    const { seen } = await proxyPost(keepHostname, () => "http://evil.test");
+    assertEquals(seen.origin, "http://evil.test");
+  }
+});
+
+/**
+ * Registers `svc` on a fresh master, opens a WebSocket to it through the proxy
+ * with the given `Origin`, and returns the headers the upstream's upgrade saw.
+ */
+const proxyWebsocket = async (
+  keepHostname: boolean,
+  origin: (proxyPort: number) => string,
+): Promise<{ seen: SeenHeaders; port: number; upstreamPort: number }> => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  let seen: SeenHeaders | undefined;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: (req) => {
+      seen = {
+        host: req.headers.get("Host"),
+        origin: req.headers.get("Origin"),
+        forwardedHost: req.headers.get("X-Forwarded-Host"),
+        forwardedProto: req.headers.get("X-Forwarded-Proto"),
+      };
+      const { socket, response } = Deno.upgradeWebSocket(req);
+      socket.onerror = () => {};
+      return response;
+    },
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", { port: upstreamPort, keepHostname });
+    const ws = new WebSocket(`ws://svc.localhost:${port}/`, {
+      headers: { Origin: origin(port) },
+    });
+    ws.onerror = () => {};
+    await waitFor(() => seen !== undefined);
+    ws.close();
+    return { seen: seen!, port, upstreamPort };
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+};
+
+Deno.test(
+  "websocket: a same-origin upgrade keeps Host and Origin consistent",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    for (const keepHostname of [false, true]) {
+      const { seen, port, upstreamPort } = await proxyWebsocket(
+        keepHostname,
+        (port) => `http://svc.localhost:${port}`,
+      );
+      const upstreamHost = `${
+        keepHostname ? "svc.localhost" : "localhost"
+      }:${upstreamPort}`;
+      assertEquals(seen, {
+        host: upstreamHost,
+        origin: `http://${upstreamHost}`,
+        forwardedHost: `svc.localhost:${port}`,
+        forwardedProto: "http",
+      });
+    }
+  },
+);
+
+Deno.test(
+  "websocket: a cross-site Origin is forwarded untouched",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const { seen } = await proxyWebsocket(false, () => "http://evil.test");
+    assertEquals(seen.origin, "http://evil.test");
+  },
+);
+
 Deno.test("master: unknown proxy host returns 404", async () => {
   const port = getAvailablePort()!;
   const server = createServer({ port });
