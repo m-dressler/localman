@@ -134,6 +134,31 @@ Deno.test("master: forwards proxied requests to the registered port", async () =
   }
 });
 
+Deno.test("master: streams the request body to the upstream", async () => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: async (req) => new Response(await req.text()),
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", {
+      port: upstreamPort,
+      keepHostname: false,
+    });
+    const res = await fetch(`http://svc.localhost:${port}/`, {
+      method: "POST",
+      body: "payload",
+    });
+    assertEquals(await res.text(), "payload");
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+});
+
 /** Headers relevant to origin checks, as seen by an upstream behind the proxy. */
 type SeenHeaders = {
   host: string | null;

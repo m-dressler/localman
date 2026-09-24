@@ -234,7 +234,6 @@ const forwardRequest = async (
       method: req.method,
       headers,
       body: req.body,
-      duplex: "half",
     });
   } catch (err) {
     console.error("Failed to forward to port", config.port, err);
