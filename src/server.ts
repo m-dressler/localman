@@ -370,9 +370,25 @@ const handleLocalmanRequest = (
   );
 };
 
-/** Builds the master's request handler over the given routing `state`. */
+/** Whether `hostname` is an IPv4 (`127.0.0.0/8`) or IPv6 (`::1`) loopback address. */
+const isLoopback = (hostname: string): boolean =>
+  hostname.startsWith("127.") || hostname === "::1";
+
+/**
+ * Builds the master's request handler over the given routing `state`.
+ *
+ * The port is bound on all interfaces, since macOS only lets unprivileged users
+ * bind port 80 that way, so peers other than this machine are refused here.
+ */
 const createHandler =
-  (state: HandlerState): Deno.ServeHandler<Deno.NetAddr> => (req) => {
+  (state: HandlerState): Deno.ServeHandler<Deno.NetAddr> => (req, info) => {
+    if (!isLoopback(info.remoteAddr.hostname)) {
+      return Response.json(
+        { message: "Localman only accepts connections from this machine" },
+        { status: 403 },
+      );
+    }
+
     const url = new URL(req.url);
     if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
       return handleLocalmanRequest(req, url, state);

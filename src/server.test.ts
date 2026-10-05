@@ -366,6 +366,41 @@ Deno.test(
   },
 );
 
+/** A non-loopback IPv4 address of this machine, if it has one. */
+const lanAddress = Deno.networkInterfaces().find((iface) =>
+  iface.family === "IPv4" && !iface.address.startsWith("127.")
+)?.address;
+
+Deno.test({
+  name: "master: rejects requests from non-loopback peers",
+  // Needs a second interface to connect from; CI runners and laptops have one.
+  ignore: !lanAddress,
+  fn: async () => {
+    const port = getAvailablePort()!;
+    const server = createServer({ port });
+    try {
+      // The Host header is client-controlled, so it must not grant access.
+      // `fetch` overrides Host, hence the hand-written request.
+      for (const host of ["localhost", "svc.localhost"]) {
+        const conn = await Deno.connect({ hostname: lanAddress, port });
+        await conn.write(
+          new TextEncoder().encode(
+            `GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+          ),
+        );
+        const buf = new Uint8Array(1024);
+        const n = await conn.read(buf);
+        conn.close();
+        const statusLine = new TextDecoder().decode(buf.subarray(0, n ?? 0))
+          .split("\r\n")[0];
+        assertEquals(statusLine, "HTTP/1.1 403 Forbidden");
+      }
+    } finally {
+      await server.close();
+    }
+  },
+});
+
 Deno.test("master: unknown proxy host returns 404", async () => {
   const port = getAvailablePort()!;
   const server = createServer({ port });
