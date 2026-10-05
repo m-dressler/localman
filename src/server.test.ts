@@ -162,6 +162,98 @@ Deno.test("master: streams the request body to the upstream", async () => {
   }
 });
 
+Deno.test("master: passes upstream redirects through to the client", async () => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: (req) =>
+      new URL(req.url).pathname === "/login"
+        ? new Response(null, {
+          status: 302,
+          headers: { Location: "/dashboard", "Set-Cookie": "session=1" },
+        })
+        : new Response("dashboard"),
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", {
+      port: upstreamPort,
+      keepHostname: false,
+    });
+    // The browser must see the redirect itself, or it loses the cookie set
+    // alongside it and ends up on the wrong URL.
+    const res = await fetch(`http://svc.localhost:${port}/login`, {
+      redirect: "manual",
+    });
+    await res.body?.cancel();
+    assertEquals(res.status, 302);
+    assertEquals(res.headers.get("Location"), "/dashboard");
+    assertEquals(res.headers.get("Set-Cookie"), "session=1");
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+});
+
+Deno.test(
+  "master: a redirect to the upstream's own address points back at the proxy",
+  async () => {
+    for (const keepHostname of [false, true]) {
+      const port = getAvailablePort()!;
+      const upstreamPort = getAvailablePort()!;
+      const upstream = Deno.serve({
+        port: upstreamPort,
+        onListen: () => {},
+        // Frameworks often build absolute redirects from the Host they see.
+        handler: (req) =>
+          Response.redirect(new URL("/dashboard?tab=1#top", req.url), 302),
+      });
+      const server = createServer({ port });
+      try {
+        await server.registerHost("svc", { port: upstreamPort, keepHostname });
+        const res = await fetch(`http://svc.localhost:${port}/login`, {
+          redirect: "manual",
+        });
+        await res.body?.cancel();
+        assertEquals(
+          res.headers.get("Location"),
+          `http://svc.localhost:${port}/dashboard?tab=1#top`,
+        );
+      } finally {
+        await server.close();
+        await upstream.shutdown();
+      }
+    }
+  },
+);
+
+Deno.test("master: a redirect to a foreign host is left untouched", async () => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: () => Response.redirect("https://auth.example/authorize", 302),
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", {
+      port: upstreamPort,
+      keepHostname: false,
+    });
+    const res = await fetch(`http://svc.localhost:${port}/login`, {
+      redirect: "manual",
+    });
+    await res.body?.cancel();
+    assertEquals(res.headers.get("Location"), "https://auth.example/authorize");
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+});
+
 /** Headers relevant to origin checks, as seen by an upstream behind the proxy. */
 type SeenHeaders = {
   host: string | null;

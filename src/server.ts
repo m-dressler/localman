@@ -197,11 +197,42 @@ const forwardWebsocket = async (
 };
 
 /**
+ * Maps an absolute `Location` pointing at the upstream's own `upstreamOrigin`
+ * back onto the `proxyOrigin` the client used, so a redirect built from the
+ * upstream's `Host` doesn't send the browser around the proxy. Relative and
+ * foreign locations are returned as is.
+ */
+const rewriteLocation = (
+  res: Response,
+  upstreamOrigin: string,
+  proxyOrigin: string,
+): Response => {
+  const location = URL.parse(res.headers.get("Location") ?? "");
+  if (location?.origin !== upstreamOrigin) return res;
+
+  // Responses from `fetch` have immutable headers, so rebuild around the body.
+  const headers = new Headers(res.headers);
+  headers.set(
+    "Location",
+    new URL(
+      location.pathname + location.search + location.hash,
+      proxyOrigin,
+    ).href,
+  );
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
+};
+
+/**
  * Forwards a proxied request to the local port named by `config`.
  *
  * `fetch` and `WebSocket` derive `Host` from the upstream URL, so a same-origin `Origin` is
- * mapped to that same upstream origin to keep origin checks consistent. The
- * address the client actually used is passed on as `X-Forwarded-Host`/`-Proto`.
+ * mapped to that same upstream origin to keep origin checks consistent, and a
+ * redirect to that upstream origin is mapped back. The address the client
+ * actually used is passed on as `X-Forwarded-Host`/`-Proto`.
  */
 const forwardRequest = async (
   req: Request,
@@ -228,11 +259,14 @@ const forwardRequest = async (
   }
 
   try {
-    return await fetch(url, {
+    const res = await fetch(url, {
       method: req.method,
       headers,
       body: req.body,
+      // Redirects are the browser's to follow, along with any cookies they set.
+      redirect: "manual",
     });
+    return rewriteLocation(res, url.origin, incoming.origin);
   } catch (err) {
     console.error("Failed to forward to port", config.port, err);
     return Response.json(
