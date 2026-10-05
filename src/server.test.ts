@@ -1,4 +1,4 @@
-import { assertEquals } from "@std/assert";
+import { assertEquals, assertRejects } from "@std/assert";
 import { getAvailablePort } from "@std/net";
 import { createServer } from "./server.ts";
 
@@ -62,9 +62,11 @@ Deno.test("master: rejects invalid registrations", async () => {
   const port = getAvailablePort()!;
   const server = createServer({ port });
   const url = `http://localhost:${port}/hosts/app`;
+  const instance = { "Localman-Instance": "test" };
   try {
     const wrongType = await fetch(url, {
       method: "POST",
+      headers: instance,
       body: "{}",
     });
     assertEquals(wrongType.status, 400);
@@ -72,7 +74,7 @@ Deno.test("master: rejects invalid registrations", async () => {
 
     const badJson = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...instance, "Content-Type": "application/json" },
       body: "not json",
     });
     assertEquals(badJson.status, 400);
@@ -80,11 +82,24 @@ Deno.test("master: rejects invalid registrations", async () => {
 
     const badShape = await fetch(url, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { ...instance, "Content-Type": "application/json" },
       body: JSON.stringify({ port: "nope" }),
     });
     assertEquals(badShape.status, 400);
     await badShape.body?.cancel();
+
+    // Every registration needs an owner whose lease can expire.
+    const noInstance = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ port: 4003 }),
+    });
+    assertEquals(noInstance.status, 400);
+    await noInstance.body?.cancel();
+
+    const unleasedWait = await fetch(`http://localhost:${port}/wait`);
+    assertEquals(unleasedWait.status, 400);
+    await unleasedWait.body?.cancel();
   } finally {
     await server.close();
   }
@@ -519,6 +534,75 @@ Deno.test("client: registers with the master over HTTP", async () => {
     });
   } finally {
     await client.close();
+    await master.close();
+  }
+});
+
+Deno.test(
+  "client: hosts of a client that went away without unregistering are freed",
+  async () => {
+    const port = getAvailablePort()!;
+    const master = createServer({ port });
+    const crashed = createServer({ port });
+    try {
+      await crashed.registerHost("web", { port: 5001, keepHostname: false });
+      // Closing without unregistering drops the lease, as SIGHUP or a crash would.
+      await crashed.close();
+      await waitFor(async () => !("web" in await listHosts(port)));
+
+      const restarted = createServer({ port });
+      try {
+        await restarted.registerHost("web", {
+          port: 5002,
+          keepHostname: false,
+        });
+        assertEquals(await listHosts(port), {
+          web: { port: 5002, keepHostname: false },
+        });
+      } finally {
+        await restarted.close();
+      }
+    } finally {
+      await master.close();
+    }
+  },
+);
+
+Deno.test("client: registering an owned host again updates it", async () => {
+  const port = getAvailablePort()!;
+  const master = createServer({ port });
+  const client = createServer({ port });
+  try {
+    await client.registerHost("web", { port: 5001, keepHostname: false });
+    await client.registerHost("web", { port: 5002, keepHostname: true });
+    assertEquals(await listHosts(port), {
+      web: { port: 5002, keepHostname: true },
+    });
+  } finally {
+    await client.close();
+    await master.close();
+  }
+});
+
+Deno.test("client: a host owned by a live client can't be taken", async () => {
+  const port = getAvailablePort()!;
+  const master = createServer({ port });
+  const owner = createServer({ port });
+  const other = createServer({ port });
+  try {
+    await owner.registerHost("web", { port: 5001, keepHostname: false });
+    await assertRejects(() =>
+      other.registerHost("web", { port: 5002, keepHostname: false })
+    );
+
+    // Nor removed by anyone but its owner.
+    await other.unregisterHost("web");
+    assertEquals(await listHosts(port), {
+      web: { port: 5001, keepHostname: false },
+    });
+  } finally {
+    await other.close();
+    await owner.close();
     await master.close();
   }
 });

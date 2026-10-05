@@ -32,12 +32,28 @@ export type LocalmanServer = {
   isMaster: () => boolean;
 };
 
+/**
+ * Header identifying the instance behind a protocol request. Its open `/wait`
+ * polls form the lease that keeps the hosts it registered alive.
+ */
+const INSTANCE_HEADER = "Localman-Instance";
+
+/** A routing table entry: a host mapping and the instance that registered it. */
+type Registration = {
+  /** Id of the instance whose lease keeps this mapping alive. */
+  owner: string;
+  config: HostConfig;
+};
+
 /** Mutable routing state owned by the request {@link createHandler}. */
 type HandlerState = {
   /** Full routing table. Authoritative only on the master. */
-  hosts: Map<string, HostConfig>;
-  /** Open long-poll stream controllers, closed on graceful shutdown to trigger failover. */
-  waiters: Set<ReadableStreamDefaultController<Uint8Array>>;
+  hosts: Map<string, Registration>;
+  /**
+   * Open long-poll stream controllers and the instance each belongs to. Closed
+   * on graceful shutdown to trigger failover.
+   */
+  waiters: Map<ReadableStreamDefaultController<Uint8Array>, string>;
 };
 
 /** Resolves after `ms` milliseconds. */
@@ -276,10 +292,14 @@ const forwardRequest = async (
   }
 };
 
-/** Handles `POST /hosts/:host` — validates and records a host mapping. */
+/**
+ * Handles `POST /hosts/:host` — validates and records a host mapping for
+ * `owner`. Registering a host the owner already holds updates it.
+ */
 const handleRegister = async (
   req: Request,
   host: string,
+  owner: string,
   state: HandlerState,
 ): Promise<Response> => {
   if (!req.headers.get("Content-Type")?.includes("application/json")) {
@@ -311,39 +331,64 @@ const handleRegister = async (
     );
   }
 
-  if (state.hosts.get(host)) {
+  const existing = state.hosts.get(host);
+  if (existing && existing.owner !== owner) {
     return Response.json(
       { message: "Host is already bound`" },
       { status: 400 },
     );
   }
 
-  state.hosts.set(host, { port, keepHostname });
+  state.hosts.set(host, { owner, config: { port, keepHostname } });
   console.debug(`Registered host   ${orange(host)} to port`, port);
   return new Response(null, { status: 204 });
 };
 
-/** Handles `DELETE /hosts/:host` — removes a host mapping (idempotent). */
-const handleUnregister = (host: string, state: HandlerState): Response => {
-  state.hosts.delete(host);
-  console.debug(`Deregistered host ${orange(host)}`);
+/**
+ * Handles `DELETE /hosts/:host` — removes a host mapping if `owner` holds it.
+ * Idempotent, and a no-op for hosts held by another instance.
+ */
+const handleUnregister = (
+  host: string,
+  owner: string,
+  state: HandlerState,
+): Response => {
+  if (state.hosts.get(host)?.owner === owner) {
+    state.hosts.delete(host);
+    console.debug(`Deregistered host ${orange(host)}`);
+  }
   return new Response(null, { status: 204 });
 };
 
 /**
- * Handles `GET /wait` — the failover long-poll. Returns a response whose body
- * never emits and stays open until the master shuts down (closing the stream)
- * or its process exits (dropping the socket), signalling clients to re-elect.
+ * Drops every host held by `owner` once its last `/wait` poll is gone, i.e.
+ * the instance exited without unregistering (SIGHUP, SIGKILL, a crash).
  */
-const handleWait = (state: HandlerState): Response => {
+const releaseLease = (owner: string, state: HandlerState): void => {
+  if ([...state.waiters.values()].includes(owner)) return;
+  for (const [host, registration] of state.hosts) {
+    if (registration.owner !== owner) continue;
+    state.hosts.delete(host);
+    console.debug(`Released host     ${orange(host)}`);
+  }
+};
+
+/**
+ * Handles `GET /wait` — the failover long-poll and `owner`'s lease. Returns a
+ * response whose body never emits and stays open until the master shuts down
+ * (closing the stream) or its process exits (dropping the socket), signalling
+ * clients to re-elect. Should the client drop it instead, its lease ends.
+ */
+const handleWait = (owner: string, state: HandlerState): Response => {
   let controller: ReadableStreamDefaultController<Uint8Array>;
   const body = new ReadableStream<Uint8Array>({
     start: (c) => {
       controller = c;
-      state.waiters.add(c);
+      state.waiters.set(c, owner);
     },
     cancel: () => {
       state.waiters.delete(controller);
+      releaseLease(owner, state);
     },
   });
   return new Response(body, { headers: { "Content-Type": "text/plain" } });
@@ -364,7 +409,7 @@ const handleRoot = (req: Request, state: HandlerState): Response => {
           state.hosts.entries(),
         )
           .map(
-            ([host, config]) =>
+            ([host, { config }]) =>
               `<tr><td><a href="http://${host}.localhost/">${host}</a></td><td>${config.port}</td></tr>`,
           )
           .join("")
@@ -372,8 +417,19 @@ const handleRoot = (req: Request, state: HandlerState): Response => {
       { headers: { "Content-Type": "text/html" } },
     );
   }
-  return Response.json(Object.fromEntries(state.hosts.entries()));
+  return Response.json(
+    Object.fromEntries(
+      Array.from(state.hosts, ([host, { config }]) => [host, config]),
+    ),
+  );
 };
+
+/** Answers a protocol request that doesn't say which instance it's from. */
+const missingInstance = (): Response =>
+  Response.json(
+    { message: `Missing ${INSTANCE_HEADER} header` },
+    { status: 400 },
+  );
 
 /** Handles requests addressed to the master itself (`localhost`). */
 const handleLocalmanRequest = (
@@ -381,18 +437,25 @@ const handleLocalmanRequest = (
   url: URL,
   state: HandlerState,
 ): Response | Promise<Response> => {
+  const owner = req.headers.get(INSTANCE_HEADER);
   const match = url.pathname.match(/^\/hosts\/([^/]+)\/?$/);
   if (match) {
     const host = match[1];
-    if (req.method === "POST") return handleRegister(req, host, state);
-    if (req.method === "DELETE") return handleUnregister(host, state);
+    if (req.method === "POST") {
+      return owner
+        ? handleRegister(req, host, owner, state)
+        : missingInstance();
+    }
+    if (req.method === "DELETE") {
+      return owner ? handleUnregister(host, owner, state) : missingInstance();
+    }
     return Response.json(
       { message: "Method not allowed; use POST or DELETE" },
       { status: 405, headers: { Allow: "POST, DELETE" } },
     );
   }
   if (url.pathname === "/wait" && req.method === "GET") {
-    return handleWait(state);
+    return owner ? handleWait(owner, state) : missingInstance();
   }
   if (url.pathname === "/" && req.method === "GET") {
     return handleRoot(req, state);
@@ -428,7 +491,8 @@ const createHandler =
       return handleLocalmanRequest(req, url, state);
     }
 
-    const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""));
+    const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""))
+      ?.config;
     if (config) return forwardRequest(req, config);
     return Response.json(
       { message: "No host registered for " + url.hostname },
@@ -454,9 +518,11 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
   const port = options.port ?? 80;
   const origin = `http://localhost:${port}`;
 
+  /** Identifies this instance to the master as the owner of its hosts. */
+  const instance = crypto.randomUUID();
   // Hosts this instance is responsible for, replayed to the master on failover.
   const ownHosts = new Map<string, HostConfig>();
-  const state: HandlerState = { hosts: new Map(), waiters: new Set() };
+  const state: HandlerState = { hosts: new Map(), waiters: new Map() };
   const handler = createHandler(state);
 
   let master = false;
@@ -480,7 +546,9 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       throw err;
     }
     master = true;
-    for (const [host, config] of ownHosts) state.hosts.set(host, config);
+    for (const [host, config] of ownHosts) {
+      state.hosts.set(host, { owner: instance, config });
+    }
     return true;
   };
 
@@ -491,7 +559,10 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
   ): Promise<void> => {
     const res = await fetch(`${origin}/hosts/${host}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        [INSTANCE_HEADER]: instance,
+      },
       body: JSON.stringify(config),
     });
     if (!res.ok) {
@@ -508,15 +579,26 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
     });
 
   /**
-   * Client loop: holds a long-poll to the master and, whenever it drops,
-   * contends for the port — becoming master on a win or re-registering on a
-   * loss — then resumes watching the (new) master.
+   * Client loop: holds a long-poll to the master as this instance's lease,
+   * replaying its hosts each time the lease is taken out. Whenever the poll
+   * drops it contends for the port — becoming master on a win — then resumes
+   * watching the (new) master.
    */
   const watchMaster = async (): Promise<void> => {
     while (running && !master) {
       try {
         pollAbort = new AbortController();
-        const res = await fetch(`${origin}/wait`, { signal: pollAbort.signal });
+        const res = await fetch(`${origin}/wait`, {
+          signal: pollAbort.signal,
+          headers: { [INSTANCE_HEADER]: instance },
+        });
+        // Only replay once the lease is held, so the hosts are released with
+        // it should this instance go away.
+        try {
+          await reRegisterAll();
+        } catch (err) {
+          console.error("Failed to re-register with master", err);
+        }
         const reader = res.body?.getReader();
         if (reader) { while (!(await reader.read()).done); }
       } catch {
@@ -528,11 +610,6 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
         console.debug("Promoted to master after previous master exited");
         return;
       }
-      try {
-        await reRegisterAll();
-      } catch (err) {
-        console.error("Failed to re-register with new master", err);
-      }
     }
   };
 
@@ -542,7 +619,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
     registerHost: async (host, config) => {
       ownHosts.set(host, config);
       if (master) {
-        state.hosts.set(host, config);
+        state.hosts.set(host, { owner: instance, config });
         return;
       }
       await withRetry(() => httpRegister(host, config));
@@ -557,6 +634,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       try {
         const res = await fetch(`${origin}/hosts/${host}`, {
           method: "DELETE",
+          headers: { [INSTANCE_HEADER]: instance },
         });
         if (!res.ok) {
           throw new Error(`Failed to unregister host (${res.status})`, {
@@ -575,7 +653,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       if (server) {
         // End the long-polls first so shutdown() isn't blocked on them, and so
         // clients fail over promptly instead of waiting for a socket timeout.
-        for (const controller of state.waiters) {
+        for (const controller of state.waiters.keys()) {
           try {
             controller.close();
           } catch {

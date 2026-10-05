@@ -52,3 +52,7 @@ owns the port. Every other instance holds a long-poll open to it. When the
 master exits, the poll drops and the survivors race to re-bind the port — one
 becomes the new master and the rest re-register their hosts with it, so the
 routing table is rebuilt automatically.
+
+The long-poll doubles as a lease: when an instance exits without unregistering
+(its terminal was closed, it was killed, it crashed), the master releases its
+hosts, so they can be taken again right away.
