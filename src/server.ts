@@ -243,16 +243,39 @@ const rewriteLocation = (
 };
 
 /**
+ * Re-streams `res`'s body so that aborting `signal` ends it. Deno serves a body
+ * taken straight from `fetch` natively, out of reach of the request's abort, so
+ * a long-lived response such as an event stream would hold `shutdown()` open.
+ * On abort the upstream is cancelled and the client's stream closed cleanly;
+ * an upstream failing on its own still fails the client's stream.
+ */
+const endOnAbort = (res: Response, signal: AbortSignal): Response => {
+  if (!res.body) return res;
+  const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+  res.body
+    .pipeTo(writable, { signal, preventAbort: true })
+    // Also rejects once the client is gone, leaving nothing to end.
+    .catch((err) =>
+      (signal.aborted ? writable.close() : writable.abort(err)).catch(() => {})
+    );
+  return new Response(readable, res);
+};
+
+/**
  * Forwards a proxied request to the local port named by `config`.
  *
  * `fetch` and `WebSocket` derive `Host` from the upstream URL, so a same-origin `Origin` is
  * mapped to that same upstream origin to keep origin checks consistent, and a
  * redirect to that upstream origin is mapped back. The address the client
  * actually used is passed on as `X-Forwarded-Host`/`-Proto`.
+ *
+ * Aborting `signal` cuts off the upstream request, ending a response that is
+ * still streaming so the server can shut down.
  */
 const forwardRequest = async (
   req: Request,
   config: HostConfig,
+  signal: AbortSignal,
 ): Promise<Response> => {
   const incoming = new URL(req.url);
   const url = new URL(req.url);
@@ -281,9 +304,21 @@ const forwardRequest = async (
       body: req.body,
       // Redirects are the browser's to follow, along with any cookies they set.
       redirect: "manual",
+      signal,
     });
-    return rewriteLocation(res, url.origin, incoming.origin);
+    return rewriteLocation(
+      endOnAbort(res, signal),
+      url.origin,
+      incoming.origin,
+    );
   } catch (err) {
+    // Cut off by our own shutdown rather than a failing upstream.
+    if (signal.aborted) {
+      return Response.json(
+        { message: "Localman is shutting down" },
+        { status: 503 },
+      );
+    }
     console.error("Failed to forward to port", config.port, err);
     return Response.json(
       { message: `Upstream on port ${config.port} is not reachable` },
@@ -476,29 +511,33 @@ const isLoopback = (hostname: string): boolean =>
  *
  * The port is bound on all interfaces, since macOS only lets unprivileged users
  * bind port 80 that way, so peers other than this machine are refused here.
+ * Aborting `closing` ends the requests it is still proxying.
  */
-const createHandler =
-  (state: HandlerState): Deno.ServeHandler<Deno.NetAddr> => (req, info) => {
-    if (!isLoopback(info.remoteAddr.hostname)) {
-      return Response.json(
-        { message: "Localman only accepts connections from this machine" },
-        { status: 403 },
-      );
-    }
-
-    const url = new URL(req.url);
-    if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
-      return handleLocalmanRequest(req, url, state);
-    }
-
-    const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""))
-      ?.config;
-    if (config) return forwardRequest(req, config);
+const createHandler = (
+  state: HandlerState,
+  closing: AbortSignal,
+): Deno.ServeHandler<Deno.NetAddr> =>
+(req, info) => {
+  if (!isLoopback(info.remoteAddr.hostname)) {
     return Response.json(
-      { message: "No host registered for " + url.hostname },
-      { status: 404 },
+      { message: "Localman only accepts connections from this machine" },
+      { status: 403 },
     );
-  };
+  }
+
+  const url = new URL(req.url);
+  if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    return handleLocalmanRequest(req, url, state);
+  }
+
+  const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""))
+    ?.config;
+  if (config) return forwardRequest(req, config, closing);
+  return Response.json(
+    { message: "No host registered for " + url.hostname },
+    { status: 404 },
+  );
+};
 
 /**
  * Creates a localman instance that either owns the port (master) or connects to
@@ -523,7 +562,9 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
   // Hosts this instance is responsible for, replayed to the master on failover.
   const ownHosts = new Map<string, HostConfig>();
   const state: HandlerState = { hosts: new Map(), waiters: new Map() };
-  const handler = createHandler(state);
+  /** Aborted on close to end requests still being proxied. */
+  const closing = new AbortController();
+  const handler = createHandler(state, closing.signal);
 
   let master = false;
   let running = true;
@@ -651,6 +692,9 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       running = false;
       pollAbort?.abort();
       if (server) {
+        // Open proxied responses, such as event streams, would hold shutdown()
+        // until the browser lets go of them.
+        closing.abort();
         // End the long-polls first so shutdown() isn't blocked on them, and so
         // clients fail over promptly instead of waiting for a socket timeout.
         for (const controller of state.waiters.keys()) {

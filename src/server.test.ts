@@ -520,6 +520,223 @@ Deno.test("master: unknown proxy host returns 404", async () => {
   }
 });
 
+/** Whether `promise` settles within `ms` milliseconds. */
+const settlesWithin = async (
+  promise: Promise<unknown>,
+  ms: number,
+): Promise<boolean> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), ms);
+  });
+  try {
+    return await Promise.race([promise.then(() => true), timeout]);
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+/**
+ * An upstream that answers with an event stream which never ends on its own.
+ * `close()` ends the streams and the server, so a test that fails while one is
+ * open still tears down instead of hanging.
+ */
+const serveEndlessStream = (port: number) => {
+  const cancelled = Promise.withResolvers<void>();
+  const streams = new Set<ReadableStreamDefaultController<Uint8Array>>();
+  const server = Deno.serve({
+    port,
+    onListen: () => {},
+    handler: () =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start: (c) => {
+            streams.add(c);
+            c.enqueue(new TextEncoder().encode("data: hi\n\n"));
+          },
+          cancel: () => cancelled.resolve(),
+        }),
+        { headers: { "Content-Type": "text/event-stream" } },
+      ),
+  });
+  const close = async () => {
+    for (const c of streams) {
+      try {
+        c.close();
+      } catch {
+        // Already cancelled.
+      }
+    }
+    await server.shutdown();
+  };
+  return { close, cancelled: cancelled.promise };
+};
+
+Deno.test(
+  "master: close() doesn't wait for open proxied streams",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = serveEndlessStream(upstreamPort);
+    const server = createServer({ port });
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      const res = await fetch(`http://svc.localhost:${port}/events`);
+      const reader = res.body!.getReader();
+      await reader.read();
+
+      // A browser tab holding e.g. an event stream must not block shutdown.
+      assertEquals(await settlesWithin(server.close(), 2000), true);
+      await reader.cancel().catch(() => {});
+    } finally {
+      await upstream.close();
+    }
+  },
+);
+
+Deno.test(
+  "master: close() doesn't wait for open proxied websockets",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      handler: (req) => {
+        const { socket, response } = Deno.upgradeWebSocket(req);
+        socket.onerror = () => {};
+        return response;
+      },
+    });
+    const server = createServer({ port });
+    let ws: WebSocket | undefined;
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      ws = new WebSocket(`ws://svc.localhost:${port}/`);
+      ws.onerror = () => {};
+      await new Promise((resolve) => ws!.onopen = resolve);
+
+      assertEquals(await settlesWithin(server.close(), 2000), true);
+    } finally {
+      ws?.close();
+      await upstream.shutdown();
+    }
+  },
+);
+
+Deno.test(
+  "master: a client disconnect cancels the upstream request",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = serveEndlessStream(upstreamPort);
+    const server = createServer({ port });
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      const res = await fetch(`http://svc.localhost:${port}/events`);
+      const reader = res.body!.getReader();
+      await reader.read();
+      await reader.cancel();
+
+      assertEquals(await settlesWithin(upstream.cancelled, 2000), true);
+    } finally {
+      await server.close();
+      await upstream.close();
+    }
+  },
+);
+
+Deno.test(
+  "master: an upstream failing mid-response fails the client's response",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      onError: () => new Response(null, { status: 500 }),
+      handler: () =>
+        new Response(
+          new ReadableStream({
+            start: (c) => {
+              c.enqueue(new TextEncoder().encode("partial"));
+              setTimeout(() => c.error(new Error("upstream broke")), 50);
+            },
+          }),
+        ),
+    });
+    const server = createServer({ port });
+    // The upstream's own failure gets logged; keep it out of the output.
+    const originalError = console.error;
+    console.error = () => {};
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      const res = await fetch(`http://svc.localhost:${port}/`);
+      // A cut-off body must not pass for a complete one.
+      await assertRejects(() => res.text());
+    } finally {
+      console.error = originalError;
+      await server.close();
+      await upstream.shutdown();
+    }
+  },
+);
+
+Deno.test(
+  "master: close() answers requests awaiting the upstream with 503",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const received = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    // Holds its response back, like a long-poll waiting for an event.
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      handler: async () => {
+        received.resolve();
+        await release.promise;
+        return new Response("late");
+      },
+    });
+    const server = createServer({ port });
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      const pending = fetch(`http://svc.localhost:${port}/poll`);
+      await received.promise;
+
+      assertEquals(await settlesWithin(server.close(), 2000), true);
+      const res = await pending;
+      await res.body?.cancel();
+      // The upstream is fine; it's localman that is going away.
+      assertEquals(res.status, 503);
+    } finally {
+      release.resolve();
+      await upstream.shutdown();
+    }
+  },
+);
+
 Deno.test("client: registers with the master over HTTP", async () => {
   const port = getAvailablePort()!;
   const master = createServer({ port });
