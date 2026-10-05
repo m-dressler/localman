@@ -824,6 +824,96 @@ Deno.test("client: a host owned by a live client can't be taken", async () => {
   }
 });
 
+Deno.test("master: a host held by another instance is a conflict", async () => {
+  const port = getAvailablePort()!;
+  const server = createServer({ port });
+  const register = (instance: string) =>
+    fetch(`http://localhost:${port}/hosts/web`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Localman-Instance": instance,
+      },
+      body: JSON.stringify({ port: 5001 }),
+    });
+  try {
+    await (await register("a")).body?.cancel();
+    const res = await register("b");
+    assertEquals(res.status, 409);
+    assertEquals(await res.json(), { message: "Host is already bound" });
+  } finally {
+    await server.close();
+  }
+});
+
+/**
+ * Occupies `port` with a stand-in master that answers every registration with
+ * `status`, counting attempts. Its `/wait` never answers, so the instance
+ * doesn't replay hosts and muddy the count.
+ */
+const serveRegistrationStub = (port: number, status: number) => {
+  const release = Promise.withResolvers<void>();
+  let attempts = 0;
+  const server = Deno.serve({
+    port,
+    onListen: () => {},
+    handler: async (req) => {
+      if (new URL(req.url).pathname === "/wait") {
+        await release.promise;
+        return new Response(null);
+      }
+      attempts++;
+      return Response.json({ message: "stub" }, { status });
+    },
+  });
+  return {
+    attempts: () => attempts,
+    close: async () => {
+      release.resolve();
+      await server.shutdown();
+    },
+  };
+};
+
+Deno.test(
+  "client: a refused registration fails without retrying",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const stub = serveRegistrationStub(port, 409);
+    const client = createServer({ port });
+    try {
+      await assertRejects(() =>
+        client.registerHost("web", { port: 5001, keepHostname: false })
+      );
+      // Asking again can't change the master's answer.
+      assertEquals(stub.attempts(), 1);
+    } finally {
+      await client.close();
+      await stub.close();
+    }
+  },
+);
+
+Deno.test(
+  "client: a failing master is retried",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const stub = serveRegistrationStub(port, 503);
+    const client = createServer({ port });
+    try {
+      await assertRejects(() =>
+        client.registerHost("web", { port: 5001, keepHostname: false })
+      );
+      assertEquals(stub.attempts(), 5);
+    } finally {
+      await client.close();
+      await stub.close();
+    }
+  },
+);
+
 Deno.test(
   "websocket: an unreachable upstream is reported as a concise error",
   // WebSocket teardown leaves background ops/connections in flight.

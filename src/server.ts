@@ -60,10 +60,14 @@ type HandlerState = {
 const delay = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+/** A protocol request the master refused (4xx); asking again gets the same answer. */
+class RefusedError extends Error {}
+
 /**
  * Runs `fn`, retrying on rejection up to `attempts` times with a fixed delay.
  * Used to bridge the brief window during failover where a freshly elected
- * master may not yet be accepting connections.
+ * master may not yet be accepting connections. A {@link RefusedError} is
+ * thrown straight away.
  */
 const withRetry = async <T>(
   fn: () => Promise<T>,
@@ -74,7 +78,7 @@ const withRetry = async <T>(
     try {
       return await fn();
     } catch (err) {
-      if (attempt >= attempts) throw err;
+      if (attempt >= attempts || err instanceof RefusedError) throw err;
       await delay(delayMs);
     }
   }
@@ -381,8 +385,8 @@ const handleRegister = async (
   const existing = state.hosts.get(host);
   if (existing && existing.owner !== owner) {
     return Response.json(
-      { message: "Host is already bound`" },
-      { status: 400 },
+      { message: "Host is already bound" },
+      { status: 409 },
     );
   }
 
@@ -619,9 +623,11 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       body: JSON.stringify(config),
     });
     if (!res.ok) {
-      throw new Error(`Failed to register host (${res.status})`, {
-        cause: await res.text(),
-      });
+      const message = `Failed to register host (${res.status})`;
+      const cause = await res.text();
+      throw res.status < 500
+        ? new RefusedError(message, { cause })
+        : new Error(message, { cause });
     }
   };
 
