@@ -936,6 +936,68 @@ Deno.test(
   },
 );
 
+/**
+ * Ways a browser ends a socket, as raw frames to send after the handshake, or
+ * `null` to drop the connection without a close frame.
+ */
+const browserCloses: [string, Uint8Array | null][] = [
+  // Masked close frames; 0x03e9 = 1001 (going away, e.g. navigating away).
+  ["1001 going away", new Uint8Array([0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe9])],
+  ["no status code (1005)", new Uint8Array([0x88, 0x80, 0, 0, 0, 0])],
+  ["abrupt drop (1006)", null],
+];
+
+for (const [name, frame] of browserCloses) {
+  Deno.test(
+    `websocket: a browser closing with ${name} closes the upstream`,
+    { sanitizeResources: false, sanitizeOps: false },
+    async () => {
+      const port = getAvailablePort()!;
+      const upstreamPort = getAvailablePort()!;
+      const upstreamClosed = Promise.withResolvers<void>();
+      const upstream = Deno.serve({
+        port: upstreamPort,
+        onListen: () => {},
+        handler: (req) => {
+          const { socket, response } = Deno.upgradeWebSocket(req);
+          socket.onerror = () => {};
+          socket.onclose = () => upstreamClosed.resolve();
+          return response;
+        },
+      });
+      const server = createServer({ port });
+      try {
+        await server.registerHost("svc", {
+          port: upstreamPort,
+          keepHostname: false,
+        });
+        // By hand, since the WebSocket API can't send these codes or vanish.
+        const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+        await conn.write(
+          new TextEncoder().encode(
+            `GET / HTTP/1.1\r\n` +
+              `Host: svc.localhost:${port}\r\n` +
+              `Upgrade: websocket\r\n` +
+              `Connection: Upgrade\r\n` +
+              `Sec-WebSocket-Key: ${btoa("0123456789abcdef")}\r\n` +
+              `Sec-WebSocket-Version: 13\r\n\r\n`,
+          ),
+        );
+        await conn.read(new Uint8Array(1024)); // consume the 101 response
+        if (frame) await conn.write(frame);
+        else conn.close();
+
+        // Otherwise the dev server keeps a dead socket per page navigation.
+        assertEquals(await settlesWithin(upstreamClosed.promise, 2000), true);
+        if (frame) conn.close();
+      } finally {
+        await server.close();
+        await upstream.shutdown();
+      }
+    },
+  );
+}
+
 Deno.test(
   "failover: a client is promoted and the table is rebuilt when the master exits",
   // The failover path involves background watch loops and long-poll

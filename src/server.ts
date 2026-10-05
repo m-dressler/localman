@@ -84,6 +84,14 @@ const withRetry = async <T>(
 const errorReason = (event: Event): string =>
   event instanceof ErrorEvent ? event.message : event.type;
 
+/**
+ * Whether a socket opened with `new WebSocket` may close with `code`. The API
+ * throws for protocol-reserved codes a peer may still report, such as 1001
+ * (going away) or 1006 (dropped without a close frame).
+ */
+const isSendableCloseCode = (code: number): boolean =>
+  code === 1000 || (code >= 3000 && code <= 4999);
+
 /** A message relayed between the two sides of a proxied WebSocket. */
 type WebsocketData = string | ArrayBufferLike | Blob | ArrayBufferView;
 
@@ -162,7 +170,11 @@ const forwardWebsocket = async (
         ws.readyState === WebSocket.CONNECTING
       ) {
         try {
-          ws.close(code, reason);
+          // Rather than throw and leave the upstream open, close it without a
+          // status. The client's socket relays any code, and drops the
+          // connection for 1005/1006 so the browser sees an unclean close.
+          if (ws === upstream && !isSendableCloseCode(code)) ws.close();
+          else ws.close(code, reason);
         } catch {
           // Ignore
         }
