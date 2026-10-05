@@ -109,30 +109,33 @@ Deno.test("master: unsupported method and unknown route", async () => {
   }
 });
 
-Deno.test("master: forwards proxied requests to the registered port", async () => {
-  const port = getAvailablePort()!;
-  const upstreamPort = getAvailablePort()!;
-  const upstream = Deno.serve({
-    port: upstreamPort,
-    onListen: () => {},
-    handler: (req) => Response.json({ seenUrl: req.url }),
-  });
-  const server = createServer({ port });
-  try {
-    await server.registerHost("svc", {
+Deno.test(
+  "master: forwards proxied requests to the registered port",
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    const upstream = Deno.serve({
       port: upstreamPort,
-      keepHostname: false,
+      onListen: () => {},
+      handler: (req) => Response.json({ seenUrl: req.url }),
     });
-    const res = await fetch(`http://svc.localhost:${port}/hello`);
-    assertEquals(res.status, 200);
-    assertEquals(await res.json(), {
-      seenUrl: `http://localhost:${upstreamPort}/hello`,
-    });
-  } finally {
-    await server.close();
-    await upstream.shutdown();
-  }
-});
+    const server = createServer({ port });
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      const res = await fetch(`http://svc.localhost:${port}/hello`);
+      assertEquals(res.status, 200);
+      assertEquals(await res.json(), {
+        seenUrl: `http://localhost:${upstreamPort}/hello`,
+      });
+    } finally {
+      await server.close();
+      await upstream.shutdown();
+    }
+  },
+);
 
 Deno.test("master: streams the request body to the upstream", async () => {
   const port = getAvailablePort()!;
@@ -203,31 +206,37 @@ const proxyPost = async (
   }
 };
 
-Deno.test("master: a same-origin request keeps Host and Origin consistent", async () => {
-  const { seen, port, upstreamPort } = await proxyPost(
-    false,
-    (port) => `http://svc.localhost:${port}`,
-  );
-  assertEquals(seen, {
-    host: `localhost:${upstreamPort}`,
-    origin: `http://localhost:${upstreamPort}`,
-    forwardedHost: `svc.localhost:${port}`,
-    forwardedProto: "http",
-  });
-});
+Deno.test(
+  "master: a same-origin request keeps Host and Origin consistent",
+  async () => {
+    const { seen, port, upstreamPort } = await proxyPost(
+      false,
+      (port) => `http://svc.localhost:${port}`,
+    );
+    assertEquals(seen, {
+      host: `localhost:${upstreamPort}`,
+      origin: `http://localhost:${upstreamPort}`,
+      forwardedHost: `svc.localhost:${port}`,
+      forwardedProto: "http",
+    });
+  },
+);
 
-Deno.test("master: --keep-hostname keeps Host and Origin consistent", async () => {
-  const { seen, port, upstreamPort } = await proxyPost(
-    true,
-    (port) => `http://svc.localhost:${port}`,
-  );
-  assertEquals(seen, {
-    host: `svc.localhost:${upstreamPort}`,
-    origin: `http://svc.localhost:${upstreamPort}`,
-    forwardedHost: `svc.localhost:${port}`,
-    forwardedProto: "http",
-  });
-});
+Deno.test(
+  "master: --keep-hostname keeps Host and Origin consistent",
+  async () => {
+    const { seen, port, upstreamPort } = await proxyPost(
+      true,
+      (port) => `http://svc.localhost:${port}`,
+    );
+    assertEquals(seen, {
+      host: `svc.localhost:${upstreamPort}`,
+      origin: `http://svc.localhost:${upstreamPort}`,
+      forwardedHost: `svc.localhost:${port}`,
+      forwardedProto: "http",
+    });
+  },
+);
 
 Deno.test("master: a cross-site Origin is forwarded untouched", async () => {
   for (const keepHostname of [false, true]) {
@@ -235,6 +244,10 @@ Deno.test("master: a cross-site Origin is forwarded untouched", async () => {
     assertEquals(seen.origin, "http://evil.test");
   }
 });
+
+/** The reason a WebSocket error event carries, for an assertion message. */
+const errorMessage = (event: Event): string =>
+  event instanceof ErrorEvent ? event.message : event.type;
 
 /**
  * Registers `svc` on a fresh master, opens a WebSocket to it through the proxy
@@ -309,6 +322,50 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "websocket: the subprotocol the upstream selects reaches the client",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const upstreamPort = getAvailablePort()!;
+    let requested: string | null = null;
+    const upstream = Deno.serve({
+      port: upstreamPort,
+      onListen: () => {},
+      handler: (req) => {
+        requested = req.headers.get("Sec-WebSocket-Protocol");
+        const { socket, response } = Deno.upgradeWebSocket(req, {
+          protocol: "vite-hmr",
+        });
+        socket.onerror = () => {};
+        return response;
+      },
+    });
+    const server = createServer({ port });
+    try {
+      await server.registerHost("svc", {
+        port: upstreamPort,
+        keepHostname: false,
+      });
+      // Vite's HMR client asks for `vite-hmr`; a browser fails the socket when
+      // the handshake answers without the subprotocol it asked for.
+      const protocol = await new Promise<string>((resolve, reject) => {
+        const ws = new WebSocket(`ws://svc.localhost:${port}/`, "vite-hmr");
+        ws.onopen = () => {
+          resolve(ws.protocol);
+          ws.close();
+        };
+        ws.onerror = (e) => reject(new Error(errorMessage(e)));
+      });
+      assertEquals(requested, "vite-hmr");
+      assertEquals(protocol, "vite-hmr");
+    } finally {
+      await server.close();
+      await upstream.shutdown();
+    }
+  },
+);
+
 Deno.test("master: unknown proxy host returns 404", async () => {
   const port = getAvailablePort()!;
   const server = createServer({ port });
@@ -380,7 +437,7 @@ Deno.test(
     }
 
     const upstreamErrors = errors.filter((args) =>
-      String(args[0]).toLowerCase().includes("upstream")
+      String(args[0]).toLowerCase().includes("upstream"),
     );
     assertEquals(upstreamErrors.length, 1);
     // Concise: a reason string, not a dumped ErrorEvent object.
@@ -425,7 +482,8 @@ Deno.test(
       const key = btoa(
         String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
       );
-      const handshake = `GET /?token=abc HTTP/1.1\r\n` +
+      const handshake =
+        `GET /?token=abc HTTP/1.1\r\n` +
         `Host: svc.localhost:${port}\r\n` +
         `Upgrade: websocket\r\n` +
         `Connection: Upgrade\r\n` +
@@ -444,7 +502,7 @@ Deno.test(
     }
 
     const clientErrors = errors.filter((args) =>
-      String(args[0]).toLowerCase().includes("client")
+      String(args[0]).toLowerCase().includes("client"),
     );
     assertEquals(clientErrors.length, 0);
   },
@@ -477,10 +535,7 @@ Deno.test(
       await waitFor(() => clientB.isMaster() !== clientC.isMaster());
 
       // Exactly one client took over.
-      assertEquals(
-        Number(clientB.isMaster()) + Number(clientC.isMaster()),
-        1,
-      );
+      assertEquals(Number(clientB.isMaster()) + Number(clientC.isMaster()), 1);
 
       // Both hosts were collectively re-registered onto the new master: the
       // winner seeds its own, the loser replays its own over HTTP.

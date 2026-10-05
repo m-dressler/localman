@@ -68,92 +68,100 @@ const withRetry = async <T>(
 const errorReason = (event: Event): string =>
   event instanceof ErrorEvent ? event.message : event.type;
 
-/** Proxies a WebSocket upgrade to `url`, opening the upstream with `headers`. */
-const forwardWebsocket = (
+/** A message relayed between the two sides of a proxied WebSocket. */
+type WebsocketData = string | ArrayBufferLike | Blob | ArrayBufferView;
+
+/**
+ * Proxies a WebSocket upgrade to `url`, opening the upstream with `headers`.
+ *
+ * The client is upgraded only once the upstream has opened, so its handshake
+ * carries the subprotocol the upstream selected — a browser fails a socket
+ * whose handshake omits the subprotocol it asked for (Vite's HMR asks for
+ * `vite-hmr`) — and an upstream that never opens is answered with a 502 rather
+ * than an upgrade that closes at once.
+ */
+const forwardWebsocket = async (
   req: Request,
   url: URL,
   headers: Headers,
-): Response => {
+): Promise<Response> => {
+  // `WebSocket` drops a subprotocol passed as a header; it takes them as `protocols`.
+  const protocols = (req.headers.get("Sec-WebSocket-Protocol") ?? "")
+    .split(",")
+    .map((protocol) => protocol.trim())
+    .filter(Boolean);
+  headers.delete("Sec-WebSocket-Protocol");
+
   let upstream: WebSocket;
   try {
-    upstream = new WebSocket(url, { headers });
+    upstream = new WebSocket(url, { protocols, headers });
   } catch (err) {
     console.error("WebSocket | Failed to connect upstream", err);
-
-    queueMicrotask(() => {
-      try {
-        client.close(1011, "Failed to connect upstream");
-      } catch {
-        // Ignore
-      }
-    });
-
     return Response.json(
       { message: "Failed to proxy websocket" },
       { status: 500 },
     );
   }
 
-  const { socket: client, response } = Deno.upgradeWebSocket(req);
+  // Messages the upstream sends before the client's socket has opened.
+  const upstreamQueue: WebsocketData[] = [];
+  upstream.onmessage = ({ data }) => upstreamQueue.push(data);
+
+  const opened = await new Promise<boolean>((resolve) => {
+    upstream.onopen = () => resolve(true);
+    upstream.onclose = () => resolve(false);
+    upstream.onerror = (event) => {
+      // A failure before it ever opened means the upstream refused or could
+      // not complete the handshake — a genuine (often misconfigured-port)
+      // problem worth surfacing.
+      console.error(
+        "WebSocket | Upstream connection failed",
+        errorReason(event),
+      );
+      resolve(false);
+    };
+  });
+  if (!opened) {
+    return Response.json(
+      { message: `Upstream WebSocket on port ${url.port} is not reachable` },
+      { status: 502 },
+    );
+  }
+
+  const { socket: client, response } = Deno.upgradeWebSocket(req, {
+    protocol: upstream.protocol || undefined,
+  });
 
   let closed = false;
-  let upstreamOpened = false;
-
-  const clientQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] = [];
-  const upstreamQueue: (string | ArrayBufferLike | Blob | ArrayBufferView)[] =
-    [];
 
   const isOpen = (ws: WebSocket) => ws.readyState === WebSocket.OPEN;
-
-  const flush = (queue: typeof clientQueue, target: WebSocket) => {
-    while (queue.length && isOpen(target)) {
-      target.send(queue.shift()!);
-    }
-  };
 
   const closeBoth = (code = 1000, reason?: string) => {
     if (closed) return;
     closed = true;
 
-    if (
-      client.readyState === WebSocket.OPEN ||
-      client.readyState === WebSocket.CONNECTING
-    ) {
-      try {
-        client.close(code, reason);
-      } catch {
-        // Ignore
-      }
-    }
-
-    if (
-      upstream.readyState === WebSocket.OPEN ||
-      upstream.readyState === WebSocket.CONNECTING
-    ) {
-      try {
-        upstream.close(code, reason);
-      } catch {
-        // Ignore
+    for (const ws of [client, upstream]) {
+      if (
+        ws.readyState === WebSocket.OPEN ||
+        ws.readyState === WebSocket.CONNECTING
+      ) {
+        try {
+          ws.close(code, reason);
+        } catch {
+          // Ignore
+        }
       }
     }
   };
 
   client.onopen = () => {
-    flush(upstreamQueue, client);
-  };
-
-  upstream.onopen = () => {
-    upstreamOpened = true;
-    flush(clientQueue, upstream);
+    while (upstreamQueue.length && isOpen(client)) {
+      client.send(upstreamQueue.shift()!);
+    }
   };
 
   client.onmessage = ({ data }) => {
-    if (closed) return;
-
-    if (isOpen(upstream)) upstream.send(data);
-    else if (upstream.readyState === WebSocket.CONNECTING) {
-      clientQueue.push(data);
-    }
+    if (!closed && isOpen(upstream)) upstream.send(data);
   };
 
   upstream.onmessage = ({ data }) => {
@@ -181,18 +189,8 @@ const forwardWebsocket = (
   };
 
   upstream.onerror = (event) => {
-    // A drop once the upstream has opened, or once teardown is already under
-    // way, is an expected lifecycle event. A failure before it ever opened
-    // means the upstream refused or could not complete the handshake — a
-    // genuine (often misconfigured-port) problem worth surfacing.
-    if (closed || upstreamOpened) {
-      console.debug("WebSocket | Upstream disconnected", errorReason(event));
-    } else {
-      console.error(
-        "WebSocket | Upstream connection failed",
-        errorReason(event),
-      );
-    }
+    // A drop once the upstream has opened is an expected lifecycle event.
+    console.debug("WebSocket | Upstream disconnected", errorReason(event));
   };
 
   return response;
