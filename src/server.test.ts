@@ -848,28 +848,36 @@ Deno.test("master: a host held by another instance is a conflict", async () => {
 
 /**
  * Occupies `port` with a stand-in master that answers every registration with
- * `status`, counting attempts. Its `/wait` never answers, so the instance
- * doesn't replay hosts and muddy the count.
+ * `status`, counting attempts, and announces `protocol` (none if undefined).
+ * Its `/wait` grants a lease that lasts until `close()`.
  */
-const serveRegistrationStub = (port: number, status: number) => {
-  const release = Promise.withResolvers<void>();
+const serveStubMaster = (
+  port: number,
+  { status, protocol }: { status: number; protocol?: string },
+) => {
+  const headers: HeadersInit = protocol
+    ? { "Localman-Protocol": protocol }
+    : {};
+  const leases = new Set<ReadableStreamDefaultController<Uint8Array>>();
   let attempts = 0;
   const server = Deno.serve({
     port,
     onListen: () => {},
-    handler: async (req) => {
+    handler: (req) => {
       if (new URL(req.url).pathname === "/wait") {
-        await release.promise;
-        return new Response(null);
+        return new Response(
+          new ReadableStream<Uint8Array>({ start: (c) => leases.add(c) }),
+          { headers },
+        );
       }
       attempts++;
-      return Response.json({ message: "stub" }, { status });
+      return new Response(null, { status, headers });
     },
   });
   return {
     attempts: () => attempts,
     close: async () => {
-      release.resolve();
+      for (const lease of leases) lease.close();
       await server.shutdown();
     },
   };
@@ -880,7 +888,7 @@ Deno.test(
   { sanitizeResources: false, sanitizeOps: false },
   async () => {
     const port = getAvailablePort()!;
-    const stub = serveRegistrationStub(port, 409);
+    const stub = serveStubMaster(port, { status: 409, protocol: "1" });
     const client = createServer({ port });
     try {
       await assertRejects(() =>
@@ -900,7 +908,7 @@ Deno.test(
   { sanitizeResources: false, sanitizeOps: false },
   async () => {
     const port = getAvailablePort()!;
-    const stub = serveRegistrationStub(port, 503);
+    const stub = serveStubMaster(port, { status: 503, protocol: "1" });
     const client = createServer({ port });
     try {
       await assertRejects(() =>
@@ -910,6 +918,118 @@ Deno.test(
     } finally {
       await client.close();
       await stub.close();
+    }
+  },
+);
+
+Deno.test("master: protocol responses announce the protocol version", async () => {
+  const port = getAvailablePort()!;
+  const server = createServer({ port });
+  try {
+    const listing = await fetch(`http://localhost:${port}/`);
+    await listing.body?.cancel();
+    assertEquals(listing.headers.get("Localman-Protocol"), "1");
+
+    // Refusals too, so an instance can tell them from a foreign server's.
+    const refused = await fetch(`http://localhost:${port}/hosts/web`, {
+      method: "POST",
+    });
+    await refused.body?.cancel();
+    assertEquals(refused.status, 400);
+    assertEquals(refused.headers.get("Localman-Protocol"), "1");
+  } finally {
+    await server.close();
+  }
+});
+
+Deno.test(
+  "client: a port held by another program is refused before registering",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const stub = serveStubMaster(port, { status: 204 });
+    const client = createServer({ port });
+    try {
+      await assertRejects(
+        () => client.registerHost("web", { port: 5001, keepHostname: false }),
+        Error,
+        `Port ${port} is in use by another program`,
+      );
+      // Nothing was left behind on a server that wouldn't release it.
+      assertEquals(stub.attempts(), 0);
+    } finally {
+      await client.close();
+      await stub.close();
+    }
+  },
+);
+
+Deno.test(
+  "client: a master speaking another protocol is refused before registering",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const stub = serveStubMaster(port, { status: 204, protocol: "2" });
+    const client = createServer({ port });
+    try {
+      await assertRejects(
+        () => client.registerHost("web", { port: 5001, keepHostname: false }),
+        Error,
+        "protocol 2",
+      );
+      assertEquals(stub.attempts(), 0);
+    } finally {
+      await client.close();
+      await stub.close();
+    }
+  },
+);
+
+Deno.test(
+  "client: an incompatible master found while watching is reported",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    const stub = serveStubMaster(port, { status: 204 });
+    const reported = Promise.withResolvers<Error>();
+    // E.g. another program grabbed the port after the previous master exited.
+    const client = createServer({
+      port,
+      onIncompatibleMaster: reported.resolve,
+    });
+    try {
+      assertEquals(await settlesWithin(reported.promise, 2000), true);
+    } finally {
+      await client.close();
+      await stub.close();
+    }
+  },
+);
+
+Deno.test(
+  "client: backs off while the port's holder doesn't answer",
+  { sanitizeResources: false, sanitizeOps: false },
+  async () => {
+    const port = getAvailablePort()!;
+    // Holds the port but hangs up on every connection, like a master that is
+    // halfway through shutting down.
+    const listener = Deno.listen({ port });
+    let connections = 0;
+    const accepting = (async () => {
+      for await (const conn of listener) {
+        connections++;
+        conn.close();
+      }
+    })();
+    const client = createServer({ port });
+    try {
+      await new Promise((r) => setTimeout(r, 500));
+      // Without a pause between attempts this runs into the thousands.
+      assertEquals(connections < 50, true, `${connections} connections`);
+    } finally {
+      await client.close();
+      listener.close();
+      await accepting.catch(() => {});
     }
   },
 );

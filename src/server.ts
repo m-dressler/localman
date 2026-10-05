@@ -18,6 +18,12 @@ export type ServerOptions = {
    * Overridable mainly so tests can run on an unprivileged port.
    */
   port?: number;
+  /**
+   * Called when the port turns out to be held by something other than a
+   * localman speaking this protocol, e.g. after a failover. The instance has
+   * stopped watching by then and can't serve its hosts.
+   */
+  onIncompatibleMaster?: (err: Error) => void;
 };
 
 /** Handle returned by {@link createServer} for driving a single instance. */
@@ -37,6 +43,30 @@ export type LocalmanServer = {
  * polls form the lease that keeps the hosts it registered alive.
  */
 const INSTANCE_HEADER = "Localman-Instance";
+
+/**
+ * Header the master sets on every protocol response, naming the protocol
+ * version it speaks. Its absence means the port is held by something else.
+ */
+const PROTOCOL_HEADER = "Localman-Protocol";
+
+/** Protocol version this localman speaks; bumped on incompatible changes. */
+const PROTOCOL_VERSION = "1";
+
+/**
+ * Why `res` can't have come from a master this instance can work with, or
+ * `undefined` if it can.
+ */
+const incompatibility = (res: Response, port: number): string | undefined => {
+  const protocol = res.headers.get(PROTOCOL_HEADER);
+  if (protocol === PROTOCOL_VERSION) return undefined;
+  if (protocol === null) {
+    return `Port ${port} is in use by another program, or by an older localman`;
+  }
+  return `Port ${port} is held by a localman speaking protocol ${protocol}, ` +
+    `but this one speaks protocol ${PROTOCOL_VERSION}; ` +
+    `run the same localman version for every service`;
+};
 
 /** A routing table entry: a host mapping and the instance that registered it. */
 type Registration = {
@@ -533,7 +563,7 @@ const createHandler = (
   state: HandlerState,
   closing: AbortSignal,
 ): Deno.ServeHandler<Deno.NetAddr> =>
-(req, info) => {
+async (req, info) => {
   if (!isLoopback(info.remoteAddr.hostname)) {
     return Response.json(
       { message: "Localman only accepts connections from this machine" },
@@ -543,7 +573,9 @@ const createHandler = (
 
   const url = new URL(req.url);
   if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
-    return handleLocalmanRequest(req, url, state);
+    const res = await handleLocalmanRequest(req, url, state);
+    res.headers.set(PROTOCOL_HEADER, PROTOCOL_VERSION);
+    return res;
   }
 
   const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""))
@@ -588,6 +620,22 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
   let pollAbort: AbortController | undefined;
 
   /**
+   * Settles once this instance can register hosts: resolved when it becomes
+   * master or holds a lease with a compatible one, rejected when the port's
+   * holder isn't compatible or the instance is closed first.
+   */
+  const ready = Promise.withResolvers<void>();
+  // Awaited by registerHost only, so a rejection nobody waits for is fine.
+  ready.promise.catch(() => {});
+
+  /** Stops watching a master this instance can't work with, and reports it. */
+  const giveUp = (err: Error): void => {
+    running = false;
+    ready.reject(err);
+    options.onIncompatibleMaster?.(err);
+  };
+
+  /**
    * Attempts to bind the port and become master. Returns whether it succeeded;
    * on success it seeds the routing table with this instance's own hosts.
    */
@@ -606,6 +654,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
     for (const [host, config] of ownHosts) {
       state.hosts.set(host, { owner: instance, config });
     }
+    ready.resolve();
     return true;
   };
 
@@ -622,6 +671,8 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
       },
       body: JSON.stringify(config),
     });
+    const mismatch = incompatibility(res, port);
+    if (mismatch) throw new RefusedError(mismatch);
     if (!res.ok) {
       const message = `Failed to register host (${res.status})`;
       const cause = await res.text();
@@ -641,7 +692,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
    * Client loop: holds a long-poll to the master as this instance's lease,
    * replaying its hosts each time the lease is taken out. Whenever the poll
    * drops it contends for the port — becoming master on a win — then resumes
-   * watching the (new) master.
+   * watching the (new) master. Gives up on a master it can't work with.
    */
   const watchMaster = async (): Promise<void> => {
     while (running && !master) {
@@ -651,6 +702,13 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
           signal: pollAbort.signal,
           headers: { [INSTANCE_HEADER]: instance },
         });
+        const mismatch = incompatibility(res, port);
+        if (mismatch) {
+          await res.body?.cancel();
+          giveUp(new Error(mismatch));
+          return;
+        }
+        ready.resolve();
         // Only replay once the lease is held, so the hosts are released with
         // it should this instance go away.
         try {
@@ -669,6 +727,8 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
         console.debug("Promoted to master after previous master exited");
         return;
       }
+      // Lost the port to another instance, or its holder isn't answering yet.
+      await delay(50);
     }
   };
 
@@ -676,12 +736,13 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
 
   return {
     registerHost: async (host, config) => {
+      // Never register with a master before knowing it can be worked with.
+      await ready.promise;
+      if (!master) await withRetry(() => httpRegister(host, config));
+      // Only hosts the master accepted are replayed. Should this instance have
+      // been promoted meanwhile, its table was seeded without this one.
       ownHosts.set(host, config);
-      if (master) {
-        state.hosts.set(host, { owner: instance, config });
-        return;
-      }
-      await withRetry(() => httpRegister(host, config));
+      if (master) state.hosts.set(host, { owner: instance, config });
     },
 
     unregisterHost: async (host) => {
@@ -708,6 +769,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
 
     close: async () => {
       running = false;
+      ready.reject(new Error("Localman instance was closed"));
       pollAbort?.abort();
       if (server) {
         // Open proxied responses, such as event streams, would hold shutdown()

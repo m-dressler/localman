@@ -48,10 +48,31 @@ if (import.meta.main) {
   if (!verbose) console.debug = () => {};
   else console.debug = console.debug.bind(console, "$ localman:");
 
-  const server = createServer();
+  /** The service; only started once its host is registered. */
+  let process: Deno.ChildProcess | undefined;
+
+  /** Reports why the host can't be served, stops the service and exits. */
+  const fail = (err: Error): never => {
+    console.error(
+      "localman:",
+      err.message,
+      ...(err.cause === undefined ? [] : [err.cause]),
+    );
+    try {
+      process?.kill();
+    } catch {
+      // Already exited.
+    }
+    Deno.exit(1);
+  };
+
+  const server = createServer({ onIncompatibleMaster: fail });
 
   const port = Number(Deno.env.get("PORT")) || getAvailablePort();
-  const process = runCommand([command, ...args], {
+  // A host that can't be served, e.g. as it's taken or port 80 is held by
+  // something else, doesn't start its service at all.
+  await server.registerHost(host, { port, keepHostname }).catch(fail);
+  process = runCommand([command, ...args], {
     env: { PORT: port + "", HOST: host + ".localhost" },
   });
 
@@ -60,7 +81,7 @@ if (import.meta.main) {
     if (shuttingDown) return;
     shuttingDown = true;
     try {
-      process.kill();
+      process?.kill();
     } catch {
       // Already exited.
     }
@@ -74,7 +95,6 @@ if (import.meta.main) {
   Deno.addSignalListener("SIGTERM", shutdown);
   Deno.addSignalListener("SIGINT", shutdown);
 
-  await server.registerHost(host, { port, keepHostname });
   await process.output();
   await server.unregisterHost(host);
   await server.close();
