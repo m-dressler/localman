@@ -824,6 +824,81 @@ Deno.test("client: a host owned by a live client can't be taken", async () => {
   }
 });
 
+Deno.test("master: only canonical host names and real ports register", async () => {
+  const port = getAvailablePort()!;
+  const server = createServer({ port });
+  const register = (host: string, body: unknown) =>
+    fetch(`http://localhost:${port}/hosts/${host}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Localman-Instance": "test",
+      },
+      body: JSON.stringify(body),
+    });
+  try {
+    // Browsers lowercase hostnames, so anything else could never be reached.
+    const badHosts = [
+      "API",
+      "-api",
+      "api-",
+      "api_v2",
+      "a..b",
+      ".api",
+      "a".repeat(64),
+      `${"a".repeat(60)}.`.repeat(4) + "a",
+      "api%20v2",
+    ];
+    for (const host of badHosts) {
+      const res = await register(host, { port: 5001 });
+      await res.body?.cancel();
+      assertEquals(res.status, 400, host);
+    }
+    for (const badPort of [0, 65536, 1.5, -1]) {
+      const res = await register("api", { port: badPort });
+      await res.body?.cancel();
+      assertEquals(res.status, 400, String(badPort));
+    }
+
+    const dotted = await register("api.v2", { port: 5001 });
+    assertEquals(dotted.status, 204);
+    assertEquals(await listHosts(port), {
+      "api.v2": { port: 5001, keepHostname: false },
+    });
+  } finally {
+    await server.close();
+  }
+});
+
+Deno.test("master: its own registrations follow the same rules", async () => {
+  const port = getAvailablePort()!;
+  const master = createServer({ port });
+  const client = createServer({ port });
+  try {
+    await assertRejects(() =>
+      master.registerHost("API", { port: 5001, keepHostname: false })
+    );
+    await assertRejects(() =>
+      master.registerHost("api", { port: 0, keepHostname: false })
+    );
+
+    // Nor may the master take, or remove, another instance's host.
+    await client.registerHost("web", { port: 5001, keepHostname: false });
+    await assertRejects(
+      () => master.registerHost("web", { port: 5002, keepHostname: false }),
+      Error,
+      "Host is already bound",
+    );
+    await master.unregisterHost("web");
+    assertEquals(await listHosts(port), {
+      web: { port: 5001, keepHostname: false },
+    });
+  } finally {
+    await client.close();
+    await master.close();
+  }
+});
+
 Deno.test("master: a host held by another instance is a conflict", async () => {
   const port = getAvailablePort()!;
   const server = createServer({ port });

@@ -4,7 +4,10 @@ import { createServer } from "./server.ts";
 
 /** Result of parsing the localman CLI arguments. */
 export type ParsedArgs = {
-  /** Hostname to expose the service under (`<host>.localhost`). */
+  /**
+   * Hostname to expose the service under (`<host>.localhost`), lowercased and
+   * without a `.localhost` suffix, as browsers address it.
+   */
   host: string;
   /** Preserve the original hostname when forwarding instead of rewriting to `localhost`. */
   keepHostname: boolean;
@@ -24,18 +27,18 @@ export type ParsedArgs = {
 export const parseArgs = (argv: string[]): ParsedArgs => {
   const args = [...argv];
 
-  let host = "";
+  let host: string | undefined;
   let keepHostname = false;
   let verbose = false;
-  while (args.length && !host) {
+  while (args.length && host === undefined) {
     const arg = args.shift()!;
     if (arg === "--keep-hostname") keepHostname = true;
     else if (arg === "-v" || arg === "--verbose") verbose = true;
     else if (arg.startsWith("-")) throw new Error("Unknown flag name: " + arg);
-    else host = arg;
+    else host = arg.toLowerCase().replace(/\.localhost$/, "");
   }
 
-  if (!host) throw new Error("Missing host to bind to");
+  if (host === undefined) throw new Error("Missing host to bind to");
 
   const command = args.shift();
   if (!command) throw new Error("Missing command to run");

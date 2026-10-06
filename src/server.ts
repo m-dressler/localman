@@ -373,6 +373,62 @@ const forwardRequest = async (
   }
 };
 
+/** A DNS label as browsers send it: lowercase letters, digits, inner hyphens. */
+const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/**
+ * Why `host` and `port` can't be registered, or `undefined` if they can. A host
+ * is dot-separated DNS labels in lowercase, as browsers address
+ * `<host>.localhost`, and short enough to keep that a valid hostname.
+ */
+const invalidRegistration = (
+  host: string,
+  port: number,
+): string | undefined => {
+  if (
+    host.length > 243 ||
+    !host.split(".").every((label) => DNS_LABEL.test(label))
+  ) {
+    return `Invalid host name "${host}"; ` +
+      `use lowercase DNS labels such as "api" or "api.v2"`;
+  }
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    return `Invalid port ${port}; use 1 to 65535`;
+  }
+  return undefined;
+};
+
+/** Refusal for a host another instance holds. */
+const HOST_TAKEN = "Host is already bound";
+
+/**
+ * Records `host` for `owner` unless another instance holds it, returning
+ * whether it did. Registering a host the owner already holds updates it.
+ */
+const claimHost = (
+  state: HandlerState,
+  host: string,
+  owner: string,
+  config: HostConfig,
+): boolean => {
+  const existing = state.hosts.get(host);
+  if (existing && existing.owner !== owner) return false;
+  state.hosts.set(host, { owner, config });
+  console.debug(`Registered host   ${orange(host)} to port`, config.port);
+  return true;
+};
+
+/** Removes `host` if `owner` holds it; a no-op for another instance's host. */
+const releaseHost = (
+  state: HandlerState,
+  host: string,
+  owner: string,
+): void => {
+  if (state.hosts.get(host)?.owner !== owner) return;
+  state.hosts.delete(host);
+  console.debug(`Deregistered host ${orange(host)}`);
+};
+
 /**
  * Handles `POST /hosts/:host` — validates and records a host mapping for
  * `owner`. Registering a host the owner already holds updates it.
@@ -412,16 +468,12 @@ const handleRegister = async (
     );
   }
 
-  const existing = state.hosts.get(host);
-  if (existing && existing.owner !== owner) {
-    return Response.json(
-      { message: "Host is already bound" },
-      { status: 409 },
-    );
-  }
+  const invalid = invalidRegistration(host, port);
+  if (invalid) return Response.json({ message: invalid }, { status: 400 });
 
-  state.hosts.set(host, { owner, config: { port, keepHostname } });
-  console.debug(`Registered host   ${orange(host)} to port`, port);
+  if (!claimHost(state, host, owner, { port, keepHostname })) {
+    return Response.json({ message: HOST_TAKEN }, { status: 409 });
+  }
   return new Response(null, { status: 204 });
 };
 
@@ -434,10 +486,7 @@ const handleUnregister = (
   owner: string,
   state: HandlerState,
 ): Response => {
-  if (state.hosts.get(host)?.owner === owner) {
-    state.hosts.delete(host);
-    console.debug(`Deregistered host ${orange(host)}`);
-  }
+  releaseHost(state, host, owner);
   return new Response(null, { status: 204 });
 };
 
@@ -663,7 +712,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
     host: string,
     config: HostConfig,
   ): Promise<void> => {
-    const res = await fetch(`${origin}/hosts/${host}`, {
+    const res = await fetch(`${origin}/hosts/${encodeURIComponent(host)}`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -736,23 +785,28 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
 
   return {
     registerHost: async (host, config) => {
+      const invalid = invalidRegistration(host, config.port);
+      if (invalid) throw new Error(invalid);
       // Never register with a master before knowing it can be worked with.
       await ready.promise;
       if (!master) await withRetry(() => httpRegister(host, config));
-      // Only hosts the master accepted are replayed. Should this instance have
-      // been promoted meanwhile, its table was seeded without this one.
+      // Should this instance have been promoted meanwhile, its table was
+      // seeded without this host.
+      if (master && !claimHost(state, host, instance, config)) {
+        throw new Error(HOST_TAKEN);
+      }
+      // Only hosts the master accepted are replayed.
       ownHosts.set(host, config);
-      if (master) state.hosts.set(host, { owner: instance, config });
     },
 
     unregisterHost: async (host) => {
       ownHosts.delete(host);
       if (master) {
-        state.hosts.delete(host);
+        releaseHost(state, host, instance);
         return;
       }
       try {
-        const res = await fetch(`${origin}/hosts/${host}`, {
+        const res = await fetch(`${origin}/hosts/${encodeURIComponent(host)}`, {
           method: "DELETE",
           headers: { [INSTANCE_HEADER]: instance },
         });

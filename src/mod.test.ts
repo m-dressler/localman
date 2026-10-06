@@ -19,6 +19,15 @@ Deno.test("parseArgs: flags before the host are consumed", () => {
   assertEquals(parsed.command, "server");
 });
 
+Deno.test("parseArgs: normalizes the host as a browser would address it", () => {
+  assertEquals(parseArgs(["API", "server"]).host, "api");
+  assertEquals(parseArgs(["api.localhost", "server"]).host, "api");
+  assertEquals(parseArgs(["Api.V2.LOCALHOST", "server"]).host, "api.v2");
+  // Left for registration to reject, rather than taking the command as host.
+  const empty = parseArgs([".localhost", "server"]);
+  assertEquals([empty.host, empty.command], ["", "server"]);
+});
+
 Deno.test("parseArgs: --verbose alias", () => {
   assertEquals(parseArgs(["--verbose", "app", "server"]).verbose, true);
 });
