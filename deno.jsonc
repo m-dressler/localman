@@ -1,6 +1,6 @@
 {
   "name": "@md/localman",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "license": "ISC",
   "exports": "./src/mod.ts",
   "tasks": {
