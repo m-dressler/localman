@@ -12,7 +12,7 @@
  */
 
 import { getAvailablePort } from "@std/net/get-available-port";
-import { parseArgs, parseLocalmanPort } from "./cli.ts";
+import { parseArgs, parseLocalmanPort, serviceEnv } from "./cli.ts";
 import { runCommand } from "./command.ts";
 import { createServer } from "./server.ts";
 
@@ -66,7 +66,7 @@ if (import.meta.main) {
   // held by something else, doesn't start its service at all.
   await server.registerHost(host, { port, keepHostname }).catch(fail);
   process = runCommand([command, ...args], {
-    env: { PORT: port + "", HOST: host + ".localhost" },
+    env: serviceEnv(host, port, localmanPort),
   });
 
   let stopping = false;

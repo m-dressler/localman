@@ -35,6 +35,18 @@ localman web npm run dev --port \$PORT
 Now `http://api.localhost/` and `http://web.localhost/` both reach their
 services, and `http://localhost/` lists every registered host.
 
+The command is started with these environment variables:
+
+| Variable        | Example                | Meaning                                   |
+| --------------- | ---------------------- | ----------------------------------------- |
+| `PORT`          | `52114`                | Port to listen on                         |
+| `LOCALMAN_HOST` | `web.localhost`        | Hostname the service is reached at        |
+| `LOCALMAN_URL`  | `http://web.localhost` | Address it is reached at, without a slash |
+
+`LOCALMAN_URL` includes the port when it isn't `80`. An argument that is exactly
+`$PORT`, `$LOCALMAN_HOST` or `$LOCALMAN_URL` is replaced by its value; escape
+the `$` so your shell leaves it for localman, as above.
+
 Localman exits with its command's exit code. Stopped by Ctrl+C or `SIGTERM`, it
 stops the command and exits with `130` or `143`, as shells report an interrupted
 process. Whichever comes first decides: should the command exit on its own

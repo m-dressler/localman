@@ -1,5 +1,5 @@
 import { assertEquals, assertThrows } from "@std/assert";
-import { parseArgs, parseLocalmanPort } from "./cli.ts";
+import { parseArgs, parseLocalmanPort, serviceEnv } from "./cli.ts";
 
 Deno.test("parseArgs: host, command and command args", () => {
   assertEquals(parseArgs(["app", "deno", "run", "-A", "x.ts"]), {
@@ -72,4 +72,17 @@ Deno.test("parseArgs: missing host throws", () => {
 
 Deno.test("parseArgs: missing command throws", () => {
   assertThrows(() => parseArgs(["app"]), Error, "Missing command");
+});
+
+Deno.test("serviceEnv: tells the command where it listens and is reached", () => {
+  assertEquals(serviceEnv("api", 4001, 8080), {
+    PORT: "4001",
+    LOCALMAN_HOST: "api.localhost",
+    LOCALMAN_URL: "http://api.localhost:8080",
+  });
+  // Browsers leave out the default port, so the URL does too.
+  assertEquals(
+    serviceEnv("api", 4001, 80).LOCALMAN_URL,
+    "http://api.localhost",
+  );
 });

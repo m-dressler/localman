@@ -64,3 +64,21 @@ export const parseLocalmanPort = (value: string | undefined): number => {
   }
   return port;
 };
+
+/**
+ * The environment a service is started with: `PORT` to listen on, and the
+ * `LOCALMAN_HOST` and `LOCALMAN_URL` it is reached at through the master on
+ * `localmanPort`. The URL has no trailing slash, and no port when that is 80.
+ * `HOST` is deliberately not set, as servers that read it bind to it.
+ */
+export const serviceEnv = (
+  host: string,
+  port: number,
+  localmanPort: number,
+): Record<string, string> => ({
+  PORT: String(port),
+  LOCALMAN_HOST: `${host}.localhost`,
+  LOCALMAN_URL: `http://${host}.localhost${
+    localmanPort === 80 ? "" : `:${localmanPort}`
+  }`,
+});

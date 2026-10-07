@@ -1,8 +1,4 @@
-import {
-  assertEquals,
-  assertMatch,
-  assertStringIncludes,
-} from "@std/assert";
+import { assertEquals, assertMatch, assertStringIncludes } from "@std/assert";
 import { getAvailablePort } from "@std/net";
 
 /** Echo service that reports the URL each request reached it with. */
@@ -177,4 +173,22 @@ Deno.test(
 Deno.test("mod: the package is a CLI and exports no API", async () => {
   // Anything exported here would be covered by semver.
   assertEquals(Object.keys(await import("./mod.ts")), []);
+});
+
+Deno.test("cli: the command gets PORT, LOCALMAN_HOST and LOCALMAN_URL", async () => {
+  const port = getAvailablePort()!;
+  const { code, stdout } = await spawnCli(String(port), [
+    "svc",
+    "sh",
+    "-c",
+    'echo "$PORT|$LOCALMAN_HOST|$LOCALMAN_URL|${HOST-unset}"',
+  ]).output();
+  assertEquals(code, 0);
+  // HOST is left alone: servers that read it take it as their bind address.
+  assertMatch(
+    new TextDecoder().decode(stdout),
+    new RegExp(
+      `^\\d+\\|svc\\.localhost\\|http://svc\\.localhost:${port}\\|unset\\n$`,
+    ),
+  );
 });
