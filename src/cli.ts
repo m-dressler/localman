@@ -7,8 +7,24 @@
 
 import { isValidPort } from "./server.ts";
 
-/** Result of parsing the localman CLI arguments. */
-export type ParsedArgs = {
+/** Usage text printed for `--help`. */
+export const USAGE =
+  `Usage: localman [--keep-hostname] [-v|--verbose] <host> <command> [...args]
+
+Runs <command> and serves it at http://<host>.localhost/, giving it PORT,
+LOCALMAN_HOST and LOCALMAN_URL in its environment.
+
+Options:
+  --keep-hostname  Forward <host>.localhost as the Host instead of localhost
+  -v, --verbose    Log debug output
+  -h, --help       Show this help
+
+Environment:
+  LOCALMAN_PORT    Port the proxy listens on (default: 80)`;
+
+/** Result of parsing the localman CLI arguments: a service to run, or help. */
+export type ParsedArgs = { action: "help" } | {
+  action: "run";
   /**
    * Hostname to expose the service under (`<host>.localhost`), lowercased and
    * without a `.localhost` suffix, as browsers address it.
@@ -27,7 +43,8 @@ export type ParsedArgs = {
 /**
  * Parses localman CLI arguments of the form
  * `[flags] <host> <command> [...commandArgs]`. Flags are only recognised before
- * the host; everything after the command is passed through verbatim.
+ * the host; everything after the command is passed through verbatim. `-h` or
+ * `--help` among the flags asks for usage instead. Throws for invalid input.
  */
 export const parseArgs = (argv: string[]): ParsedArgs => {
   const args = [...argv];
@@ -37,7 +54,8 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
   let verbose = false;
   while (args.length && host === undefined) {
     const arg = args.shift()!;
-    if (arg === "--keep-hostname") keepHostname = true;
+    if (arg === "-h" || arg === "--help") return { action: "help" };
+    else if (arg === "--keep-hostname") keepHostname = true;
     else if (arg === "-v" || arg === "--verbose") verbose = true;
     else if (arg.startsWith("-")) throw new Error("Unknown flag name: " + arg);
     else host = arg.toLowerCase().replace(/\.localhost$/, "");
@@ -48,7 +66,7 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
   const command = args.shift();
   if (!command) throw new Error("Missing command to run");
 
-  return { host, keepHostname, verbose, command, args };
+  return { action: "run", host, keepHostname, verbose, command, args };
 };
 
 /**

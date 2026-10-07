@@ -192,3 +192,19 @@ Deno.test("cli: the command gets PORT, LOCALMAN_HOST and LOCALMAN_URL", async ()
     ),
   );
 });
+
+Deno.test("cli: --help prints usage and exits 0", async () => {
+  const { code, stdout } = await spawnCli("", ["--help"]).output();
+  assertEquals(code, 0);
+  assertStringIncludes(new TextDecoder().decode(stdout), "Usage: localman");
+});
+
+Deno.test("cli: invalid arguments are a usage error, not a crash", async () => {
+  const { code, stderr } = await spawnCli("", ["--nope"]).output();
+  assertEquals(code, 2);
+  // A one-line reason and a pointer to --help, no stack trace.
+  assertEquals(
+    new TextDecoder().decode(stderr),
+    "localman: Unknown flag name: --nope\nRun `localman --help` for usage.\n",
+  );
+});

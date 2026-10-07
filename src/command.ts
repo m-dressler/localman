@@ -1,10 +1,11 @@
 import { orange } from "./color.ts";
 
 /**
- * Spawns `command` with a `PORT` environment variable set to an available port
- * (or `Deno.env.PORT` when provided), so the service knows where to listen.
+ * Spawns `command` with `opts.env` added to its environment. An argument that
+ * is exactly `$NAME` is replaced by `opts.env[NAME]` when that is set, so a
+ * service can be given e.g. its port as a flag.
  *
- * @returns The spawned child process and the port it was told to use.
+ * @returns The spawned child process.
  */
 export const runCommand = (
   command: [string, ...string[]],

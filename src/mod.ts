@@ -17,6 +17,7 @@ import {
   parseLocalmanPort,
   serviceEnv,
   unsupportedPlatform,
+  USAGE,
 } from "./cli.ts";
 import { runCommand } from "./command.ts";
 import { createServer } from "./server.ts";
@@ -28,7 +29,21 @@ import { createServer } from "./server.ts";
 const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
 
 if (import.meta.main) {
-  const { host, keepHostname, verbose, command, args } = parseArgs(Deno.args);
+  const parsed = (() => {
+    try {
+      return parseArgs(Deno.args);
+    } catch (err) {
+      // A usage error: the reason and where to look, not a stack trace.
+      console.error(`localman: ${err instanceof Error ? err.message : err}`);
+      console.error("Run `localman --help` for usage.");
+      return Deno.exit(2);
+    }
+  })();
+  if (parsed.action === "help") {
+    console.log(USAGE);
+    Deno.exit(0);
+  }
+  const { host, keepHostname, verbose, command, args } = parsed;
   if (!verbose) console.debug = () => {};
   else console.debug = console.debug.bind(console, "$ localman:");
 

@@ -1,4 +1,9 @@
-import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
+import {
+  assert,
+  assertEquals,
+  assertStringIncludes,
+  assertThrows,
+} from "@std/assert";
 import {
   parseArgs,
   parseLocalmanPort,
@@ -6,8 +11,16 @@ import {
   unsupportedPlatform,
 } from "./cli.ts";
 
+/** Parses `argv`, asserting it asks to run a service. */
+const parseRun = (argv: string[]) => {
+  const parsed = parseArgs(argv);
+  assert(parsed.action === "run");
+  return parsed;
+};
+
 Deno.test("parseArgs: host, command and command args", () => {
   assertEquals(parseArgs(["app", "deno", "run", "-A", "x.ts"]), {
+    action: "run",
     host: "app",
     keepHostname: false,
     verbose: false,
@@ -17,7 +30,7 @@ Deno.test("parseArgs: host, command and command args", () => {
 });
 
 Deno.test("parseArgs: flags before the host are consumed", () => {
-  const parsed = parseArgs(["--keep-hostname", "-v", "app", "server"]);
+  const parsed = parseRun(["--keep-hostname", "-v", "app", "server"]);
   assertEquals(parsed.keepHostname, true);
   assertEquals(parsed.verbose, true);
   assertEquals(parsed.host, "app");
@@ -25,11 +38,11 @@ Deno.test("parseArgs: flags before the host are consumed", () => {
 });
 
 Deno.test("parseArgs: normalizes the host as a browser would address it", () => {
-  assertEquals(parseArgs(["API", "server"]).host, "api");
-  assertEquals(parseArgs(["api.localhost", "server"]).host, "api");
-  assertEquals(parseArgs(["Api.V2.LOCALHOST", "server"]).host, "api.v2");
+  assertEquals(parseRun(["API", "server"]).host, "api");
+  assertEquals(parseRun(["api.localhost", "server"]).host, "api");
+  assertEquals(parseRun(["Api.V2.LOCALHOST", "server"]).host, "api.v2");
   // Left for registration to reject, rather than taking the command as host.
-  const empty = parseArgs([".localhost", "server"]);
+  const empty = parseRun([".localhost", "server"]);
   assertEquals([empty.host, empty.command], ["", "server"]);
 });
 
@@ -51,11 +64,11 @@ Deno.test("parseLocalmanPort: refuses anything else", () => {
 });
 
 Deno.test("parseArgs: --verbose alias", () => {
-  assertEquals(parseArgs(["--verbose", "app", "server"]).verbose, true);
+  assertEquals(parseRun(["--verbose", "app", "server"]).verbose, true);
 });
 
 Deno.test("parseArgs: flags after the host belong to the command", () => {
-  const parsed = parseArgs(["app", "server", "--keep-hostname", "-v"]);
+  const parsed = parseRun(["app", "server", "--keep-hostname", "-v"]);
   assertEquals(parsed.command, "server");
   assertEquals(parsed.args, ["--keep-hostname", "-v"]);
   assertEquals(parsed.keepHostname, false);
@@ -97,4 +110,11 @@ Deno.test("unsupportedPlatform: refuses Windows up front", () => {
   assertEquals(unsupportedPlatform("linux"), undefined);
   // Otherwise it registers and starts the command before failing obscurely.
   assertStringIncludes(unsupportedPlatform("windows") ?? "", "macOS and Linux");
+});
+
+Deno.test("parseArgs: -h and --help ask for usage", () => {
+  assertEquals(parseArgs(["--help"]), { action: "help" });
+  assertEquals(parseArgs(["-v", "-h", "app", "server"]), { action: "help" });
+  // After the host they belong to the command, like every other flag.
+  assertEquals(parseRun(["app", "server", "--help"]).args, ["--help"]);
 });

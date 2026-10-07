@@ -1203,7 +1203,7 @@ Deno.test(
     }
 
     const upstreamErrors = errors.filter((args) =>
-      String(args[0]).toLowerCase().includes("upstream"),
+      String(args[0]).toLowerCase().includes("upstream")
     );
     assertEquals(upstreamErrors.length, 1);
     // Concise: a reason string, not a dumped ErrorEvent object.
@@ -1248,8 +1248,7 @@ Deno.test(
       const key = btoa(
         String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
       );
-      const handshake =
-        `GET /?token=abc HTTP/1.1\r\n` +
+      const handshake = `GET /?token=abc HTTP/1.1\r\n` +
         `Host: svc.localhost:${port}\r\n` +
         `Upgrade: websocket\r\n` +
         `Connection: Upgrade\r\n` +
@@ -1268,7 +1267,7 @@ Deno.test(
     }
 
     const clientErrors = errors.filter((args) =>
-      String(args[0]).toLowerCase().includes("client"),
+      String(args[0]).toLowerCase().includes("client")
     );
     assertEquals(clientErrors.length, 0);
   },

@@ -19,6 +19,7 @@ Localman supports macOS and Linux. It refuses to start on Windows.
 
 ```
 localman [--keep-hostname] [-v|--verbose] <host> <command> [...args]
+localman --help
 ```
 
 Run a service and expose it at `api.localhost`:
@@ -31,7 +32,7 @@ In another terminal, add a second service at `web.localhost`; it registers with
 the already-running master automatically:
 
 ```sh
-localman web npm run dev --port \$PORT
+localman web npm run dev -- --port \$PORT
 ```
 
 Now `http://api.localhost/` and `http://web.localhost/` both reach their
@@ -53,7 +54,8 @@ Localman exits with its command's exit code. Stopped by Ctrl+C or `SIGTERM`, it
 stops the command and exits with `130` or `143`, as shells report an interrupted
 process. Whichever comes first decides: should the command exit on its own
 before localman handles the signal, e.g. as the terminal's Ctrl+C reached it
-too, its code is passed on instead.
+too, its code is passed on instead. Invalid arguments exit with `2` before
+anything starts.
 
 Pass `--keep-hostname` to forward the original `<host>.localhost` hostname to
 your service instead of rewriting it to `localhost`.
@@ -63,7 +65,9 @@ Either way, a same-origin `Origin` header is rewritten to match the forwarded
 untouched. The address the client used is available in `X-Forwarded-Host` and
 `X-Forwarded-Proto`.
 
-> Binding port `80` typically requires elevated privileges.
+> macOS lets any user bind port `80`. On Linux it takes elevated privileges,
+> e.g. `sudo sysctl net.ipv4.ip_unprivileged_port_start=80`, or use
+> `LOCALMAN_PORT` below.
 
 Set `LOCALMAN_PORT` to run the proxy on another port, e.g. `LOCALMAN_PORT=8080`
 serves `http://api.localhost:8080/`. Every instance that should share a routing
