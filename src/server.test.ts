@@ -52,7 +52,8 @@ Deno.test("master: root negotiates HTML when preferred", async () => {
     });
     assertEquals(res.headers.get("Content-Type"), "text/html");
     const html = await res.text();
-    assertEquals(html.includes("app.localhost"), true);
+    // Links must reach the host on whichever port the master listens on.
+    assertEquals(html.includes(`href="http://app.localhost:${port}/"`), true);
   } finally {
     await server.close();
   }
@@ -867,6 +868,58 @@ Deno.test("master: only canonical host names and real ports register", async () 
     });
   } finally {
     await server.close();
+  }
+});
+
+Deno.test("master: a service can't take the proxy's own port", async () => {
+  const port = getAvailablePort()!;
+  const master = createServer({ port });
+  const client = createServer({ port });
+  try {
+    // Forwarding there would loop requests back into the proxy.
+    const res = await fetch(`http://localhost:${port}/hosts/svc`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Localman-Instance": "test",
+      },
+      body: JSON.stringify({ port }),
+    });
+    await res.body?.cancel();
+    assertEquals(res.status, 400);
+
+    for (const instance of [master, client]) {
+      await assertRejects(
+        () => instance.registerHost("svc", { port, keepHostname: false }),
+        Error,
+        "own port",
+      );
+    }
+
+    // The Host header is the client's to choose; one without a port must not
+    // pass for a master on port 80.
+    const body = JSON.stringify({ port });
+    const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+    await conn.write(
+      new TextEncoder().encode(
+        `POST /hosts/svc HTTP/1.1\r\n` +
+          `Host: localhost\r\n` +
+          `Content-Type: application/json\r\n` +
+          `Localman-Instance: test\r\n` +
+          `Content-Length: ${body.length}\r\n` +
+          `Connection: close\r\n\r\n${body}`,
+      ),
+    );
+    const buf = new Uint8Array(1024);
+    const n = await conn.read(buf);
+    conn.close();
+    assertEquals(
+      new TextDecoder().decode(buf.subarray(0, n ?? 0)).split("\r\n")[0],
+      "HTTP/1.1 400 Bad Request",
+    );
+  } finally {
+    await client.close();
+    await master.close();
   }
 });
 

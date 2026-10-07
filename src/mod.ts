@@ -1,6 +1,6 @@
 import { getAvailablePort } from "@std/net/get-available-port";
 import { runCommand } from "./command.ts";
-import { createServer } from "./server.ts";
+import { createServer, isValidPort } from "./server.ts";
 
 /** Result of parsing the localman CLI arguments. */
 export type ParsedArgs = {
@@ -46,6 +46,20 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
   return { host, keepHostname, verbose, command, args };
 };
 
+/**
+ * Parses the `LOCALMAN_PORT` environment variable: the port the master listens
+ * on, 80 when unset or empty (as scripts commonly clear variables). Throws for
+ * anything that isn't a valid port written in plain digits.
+ */
+export const parseLocalmanPort = (value: string | undefined): number => {
+  const port = Number(value || 80);
+  // Plain digits only; Number() would also take hex, exponents and spaces.
+  if ((value && !/^\d+$/.test(value)) || !isValidPort(port)) {
+    throw new Error(`LOCALMAN_PORT must be 1 to 65535, not "${value}"`);
+  }
+  return port;
+};
+
 if (import.meta.main) {
   const { host, keepHostname, verbose, command, args } = parseArgs(Deno.args);
   if (!verbose) console.debug = () => {};
@@ -69,11 +83,22 @@ if (import.meta.main) {
     Deno.exit(1);
   };
 
-  const server = createServer({ onIncompatibleMaster: fail });
+  const localmanPort = (() => {
+    try {
+      return parseLocalmanPort(Deno.env.get("LOCALMAN_PORT"));
+    } catch (err) {
+      return fail(err instanceof Error ? err : new Error(String(err)));
+    }
+  })();
+
+  const server = createServer({
+    port: localmanPort,
+    onIncompatibleMaster: fail,
+  });
 
   const port = Number(Deno.env.get("PORT")) || getAvailablePort();
-  // A host that can't be served, e.g. as it's taken or port 80 is held by
-  // something else, doesn't start its service at all.
+  // A host that can't be served, e.g. as it's taken or the master's port is
+  // held by something else, doesn't start its service at all.
   await server.registerHost(host, { port, keepHostname }).catch(fail);
   process = runCommand([command, ...args], {
     env: { PORT: port + "", HOST: host + ".localhost" },

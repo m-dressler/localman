@@ -45,6 +45,10 @@ untouched. The address the client used is available in `X-Forwarded-Host` and
 
 > Binding port `80` typically requires elevated privileges.
 
+Set `LOCALMAN_PORT` to run the proxy on another port, e.g. `LOCALMAN_PORT=8080`
+serves `http://api.localhost:8080/`. Every instance that should share a routing
+table needs the same value.
+
 ## Failover
 
 There is no dedicated daemon: the master is just whichever instance currently
@@ -58,6 +62,6 @@ The long-poll doubles as a lease: when an instance exits without unregistering
 hosts, so they can be taken again right away.
 
 Instances talk to the master over a versioned protocol, so every service on a
-machine must run a compatible localman. An instance that finds port `80` held by
-an incompatible localman, or by another program, exits with an error before
-starting its command.
+machine must run a compatible localman. An instance that finds its port (`80`,
+or `LOCALMAN_PORT`) held by an incompatible localman, or by another program,
+exits with an error before starting its command.

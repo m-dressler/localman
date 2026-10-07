@@ -14,8 +14,8 @@ export type HostConfig = {
 /** Options for {@link createServer}. */
 export type ServerOptions = {
   /**
-   * Port the master binds to and clients connect through. Defaults to 80.
-   * Overridable mainly so tests can run on an unprivileged port.
+   * Port the master binds to and clients connect through. Defaults to 80;
+   * every instance sharing a routing table must use the same one.
    */
   port?: number;
   /**
@@ -373,17 +373,23 @@ const forwardRequest = async (
   }
 };
 
+/** Whether `port` is a TCP port a service can listen on. */
+export const isValidPort = (port: number): boolean =>
+  Number.isInteger(port) && port >= 1 && port <= 65535;
+
 /** A DNS label as browsers send it: lowercase letters, digits, inner hyphens. */
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 /**
  * Why `host` and `port` can't be registered, or `undefined` if they can. A host
  * is dot-separated DNS labels in lowercase, as browsers address
- * `<host>.localhost`, and short enough to keep that a valid hostname.
+ * `<host>.localhost`, and short enough to keep that a valid hostname. The port
+ * can't be `proxyPort`, which would loop requests back into the proxy.
  */
 const invalidRegistration = (
   host: string,
   port: number,
+  proxyPort: number,
 ): string | undefined => {
   if (
     host.length > 243 ||
@@ -392,8 +398,11 @@ const invalidRegistration = (
     return `Invalid host name "${host}"; ` +
       `use lowercase DNS labels such as "api" or "api.v2"`;
   }
-  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+  if (!isValidPort(port)) {
     return `Invalid port ${port}; use 1 to 65535`;
+  }
+  if (port === proxyPort) {
+    return `Port ${port} is localman's own port; give the service another one`;
   }
   return undefined;
 };
@@ -431,13 +440,15 @@ const releaseHost = (
 
 /**
  * Handles `POST /hosts/:host` — validates and records a host mapping for
- * `owner`. Registering a host the owner already holds updates it.
+ * `owner`. Registering a host the owner already holds updates it. `proxyPort`
+ * is the port the master is bound to, which no service may take.
  */
 const handleRegister = async (
   req: Request,
   host: string,
   owner: string,
   state: HandlerState,
+  proxyPort: number,
 ): Promise<Response> => {
   if (!req.headers.get("Content-Type")?.includes("application/json")) {
     return Response.json(
@@ -468,7 +479,7 @@ const handleRegister = async (
     );
   }
 
-  const invalid = invalidRegistration(host, port);
+  const invalid = invalidRegistration(host, port, proxyPort);
   if (invalid) return Response.json({ message: invalid }, { status: 400 });
 
   if (!claimHost(state, host, owner, { port, keepHostname })) {
@@ -526,6 +537,9 @@ const handleWait = (owner: string, state: HandlerState): Response => {
 
 /** Handles `GET /` — lists registered hosts as HTML or JSON per `Accept`. */
 const handleRoot = (req: Request, state: HandlerState): Response => {
+  // Links go through the port the master was reached on.
+  const port = new URL(req.url).port;
+  const portSuffix = port ? `:${port}` : "";
   const acceptContent = (req.headers.get("Accept") || "")
     .split(/,\s*/)
     .map((v) => v.replace(/;.*$/, ""));
@@ -540,7 +554,7 @@ const handleRoot = (req: Request, state: HandlerState): Response => {
         )
           .map(
             ([host, { config }]) =>
-              `<tr><td><a href="http://${host}.localhost/">${host}</a></td><td>${config.port}</td></tr>`,
+              `<tr><td><a href="http://${host}.localhost${portSuffix}/">${host}</a></td><td>${config.port}</td></tr>`,
           )
           .join("")
       }</tbody></table>`,
@@ -561,11 +575,15 @@ const missingInstance = (): Response =>
     { status: 400 },
   );
 
-/** Handles requests addressed to the master itself (`localhost`). */
+/**
+ * Handles requests addressed to the master itself (`localhost`), which is
+ * bound to `proxyPort`.
+ */
 const handleLocalmanRequest = (
   req: Request,
   url: URL,
   state: HandlerState,
+  proxyPort: number,
 ): Response | Promise<Response> => {
   const owner = req.headers.get(INSTANCE_HEADER);
   const match = url.pathname.match(/^\/hosts\/([^/]+)\/?$/);
@@ -573,7 +591,7 @@ const handleLocalmanRequest = (
     const host = match[1];
     if (req.method === "POST") {
       return owner
-        ? handleRegister(req, host, owner, state)
+        ? handleRegister(req, host, owner, state, proxyPort)
         : missingInstance();
     }
     if (req.method === "DELETE") {
@@ -602,7 +620,9 @@ const isLoopback = (hostname: string): boolean =>
   hostname.startsWith("127.") || hostname === "::1";
 
 /**
- * Builds the master's request handler over the given routing `state`.
+ * Builds the master's request handler over the given routing `state`, for a
+ * master bound to `proxyPort`. The `Host` header is the client's to choose, so
+ * it never stands in for that port.
  *
  * The port is bound on all interfaces, since macOS only lets unprivileged users
  * bind port 80 that way, so peers other than this machine are refused here.
@@ -611,6 +631,7 @@ const isLoopback = (hostname: string): boolean =>
 const createHandler = (
   state: HandlerState,
   closing: AbortSignal,
+  proxyPort: number,
 ): Deno.ServeHandler<Deno.NetAddr> =>
 async (req, info) => {
   if (!isLoopback(info.remoteAddr.hostname)) {
@@ -622,7 +643,7 @@ async (req, info) => {
 
   const url = new URL(req.url);
   if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
-    const res = await handleLocalmanRequest(req, url, state);
+    const res = await handleLocalmanRequest(req, url, state, proxyPort);
     res.headers.set(PROTOCOL_HEADER, PROTOCOL_VERSION);
     return res;
   }
@@ -661,7 +682,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
   const state: HandlerState = { hosts: new Map(), waiters: new Map() };
   /** Aborted on close to end requests still being proxied. */
   const closing = new AbortController();
-  const handler = createHandler(state, closing.signal);
+  const handler = createHandler(state, closing.signal, port);
 
   let master = false;
   let running = true;
@@ -785,7 +806,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
 
   return {
     registerHost: async (host, config) => {
-      const invalid = invalidRegistration(host, config.port);
+      const invalid = invalidRegistration(host, config.port, port);
       if (invalid) throw new Error(invalid);
       // Never register with a master before knowing it can be worked with.
       await ready.promise;
