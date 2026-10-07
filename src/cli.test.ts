@@ -1,5 +1,10 @@
-import { assertEquals, assertThrows } from "@std/assert";
-import { parseArgs, parseLocalmanPort, serviceEnv } from "./cli.ts";
+import { assertEquals, assertStringIncludes, assertThrows } from "@std/assert";
+import {
+  parseArgs,
+  parseLocalmanPort,
+  serviceEnv,
+  unsupportedPlatform,
+} from "./cli.ts";
 
 Deno.test("parseArgs: host, command and command args", () => {
   assertEquals(parseArgs(["app", "deno", "run", "-A", "x.ts"]), {
@@ -85,4 +90,11 @@ Deno.test("serviceEnv: tells the command where it listens and is reached", () =>
     serviceEnv("api", 4001, 80).LOCALMAN_URL,
     "http://api.localhost",
   );
+});
+
+Deno.test("unsupportedPlatform: refuses Windows up front", () => {
+  assertEquals(unsupportedPlatform("darwin"), undefined);
+  assertEquals(unsupportedPlatform("linux"), undefined);
+  // Otherwise it registers and starts the command before failing obscurely.
+  assertStringIncludes(unsupportedPlatform("windows") ?? "", "macOS and Linux");
 });

@@ -82,3 +82,15 @@ export const serviceEnv = (
     localmanPort === 80 ? "" : `:${localmanPort}`
   }`,
 });
+
+/**
+ * Why localman can't run on `os`, or `undefined` if it can. Only macOS and
+ * Linux are supported: Windows lacks the signals, the command resolution and
+ * the `*.localhost` resolution localman relies on.
+ */
+export const unsupportedPlatform = (
+  os: typeof Deno.build.os,
+): string | undefined =>
+  os === "windows"
+    ? "Localman supports macOS and Linux only, not Windows"
+    : undefined;

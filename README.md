@@ -13,6 +13,8 @@ free port, and requests to `<host>.localhost` are forwarded there.
 deno i --global -A jsr:@md/localman
 ```
 
+Localman supports macOS and Linux. It refuses to start on Windows.
+
 ## Usage
 
 ```

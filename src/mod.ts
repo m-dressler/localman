@@ -12,7 +12,12 @@
  */
 
 import { getAvailablePort } from "@std/net/get-available-port";
-import { parseArgs, parseLocalmanPort, serviceEnv } from "./cli.ts";
+import {
+  parseArgs,
+  parseLocalmanPort,
+  serviceEnv,
+  unsupportedPlatform,
+} from "./cli.ts";
 import { runCommand } from "./command.ts";
 import { createServer } from "./server.ts";
 
@@ -47,6 +52,10 @@ if (import.meta.main) {
     }
     Deno.exit(1);
   };
+
+  // Before anything is registered or started.
+  const unsupported = unsupportedPlatform(Deno.build.os);
+  if (unsupported) fail(new Error(unsupported));
 
   const localmanPort = (() => {
     try {
