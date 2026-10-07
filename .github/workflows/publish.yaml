@@ -1,12 +1,31 @@
-name: Publish
+name: Test and publish
 
 on:
   push:
     branches:
       - main
+  pull_request:
 
 jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - run: deno fmt --check
+      - run: deno lint
+      - run: deno check src/mod.ts
+      - run: deno task test
+
   publish:
+    # Only a push to main publishes, and only once the tests pass.
+    needs: test
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
       contents: read
