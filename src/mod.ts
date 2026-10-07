@@ -60,6 +60,12 @@ export const parseLocalmanPort = (value: string | undefined): number => {
   return port;
 };
 
+/**
+ * Exit codes for the signals that stop localman: 128 + the signal's number, as
+ * shells report a process they interrupted.
+ */
+const SIGNAL_EXIT_CODES = { SIGINT: 130, SIGTERM: 143 } as const;
+
 if (import.meta.main) {
   const { host, keepHostname, verbose, command, args } = parseArgs(Deno.args);
   if (!verbose) console.debug = () => {};
@@ -104,10 +110,15 @@ if (import.meta.main) {
     env: { PORT: port + "", HOST: host + ".localhost" },
   });
 
-  let shuttingDown = false;
-  const shutdown = async () => {
-    if (shuttingDown) return;
-    shuttingDown = true;
+  let stopping = false;
+  /**
+   * Stops the command, unregisters and exits with `code`. A signal and the
+   * command exiting may both get here; the first decides the code, as the
+   * other's teardown could otherwise finish first and exit with its own.
+   */
+  const stop = async (code: number) => {
+    if (stopping) return;
+    stopping = true;
     try {
       process?.kill();
     } catch {
@@ -115,15 +126,14 @@ if (import.meta.main) {
     }
     await server.unregisterHost(host);
     await server.close();
-    Deno.exit(0);
+    Deno.exit(code);
   };
 
   // Register handlers before awaiting the process so a signal during its
   // lifetime tears the service down cleanly.
-  Deno.addSignalListener("SIGTERM", shutdown);
-  Deno.addSignalListener("SIGINT", shutdown);
+  Deno.addSignalListener("SIGTERM", () => stop(SIGNAL_EXIT_CODES.SIGTERM));
+  Deno.addSignalListener("SIGINT", () => stop(SIGNAL_EXIT_CODES.SIGINT));
 
-  await process.output();
-  await server.unregisterHost(host);
-  await server.close();
+  // Deno reports a command killed by a signal as 128 + its number already.
+  await stop((await process.status).code);
 }

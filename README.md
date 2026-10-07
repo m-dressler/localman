@@ -35,6 +35,12 @@ localman web npm run dev --port \$PORT
 Now `http://api.localhost/` and `http://web.localhost/` both reach their
 services, and `http://localhost/` lists every registered host.
 
+Localman exits with its command's exit code. Stopped by Ctrl+C or `SIGTERM`, it
+stops the command and exits with `130` or `143`, as shells report an interrupted
+process. Whichever comes first decides: should the command exit on its own
+before localman handles the signal, e.g. as the terminal's Ctrl+C reached it
+too, its code is passed on instead.
+
 Pass `--keep-hostname` to forward the original `<host>.localhost` hostname to
 your service instead of rewriting it to `localhost`.
 
