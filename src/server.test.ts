@@ -1,6 +1,6 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import { getAvailablePort } from "@std/net";
-import { createServer } from "./server.ts";
+import { createServer, exposeHost } from "./server.ts";
 
 // Keep test output focused on assertions, not the instances' debug logging.
 console.debug = () => {};
@@ -507,6 +507,138 @@ Deno.test({
       await server.close();
     }
   },
+});
+
+/** Upstream echoing the `Host` and `X-Forwarded-Host` each request reached it with. */
+const serveHostEcho = (port: number) =>
+  Deno.serve({
+    port,
+    onListen: () => {},
+    handler: (req) =>
+      Response.json({
+        host: req.headers.get("Host"),
+        forwardedHost: req.headers.get("X-Forwarded-Host"),
+      }),
+  });
+
+Deno.test({
+  name: "expose: serves the host to peers on the local network",
+  ignore: !lanAddress,
+  fn: async () => {
+    const upstreamPort = getAvailablePort()!;
+    const upstream = serveHostEcho(upstreamPort);
+    const exposed = exposeHost("svc", {
+      port: upstreamPort,
+      keepHostname: false,
+    });
+    try {
+      const res = await fetch(`http://${lanAddress}:${exposed.port}/hi`);
+      assertEquals(await res.json(), {
+        host: `localhost:${upstreamPort}`,
+        forwardedHost: `${lanAddress}:${exposed.port}`,
+      });
+    } finally {
+      await exposed.close();
+      await upstream.shutdown();
+    }
+  },
+});
+
+Deno.test("expose: --keep-hostname forwards <host>.localhost, not the address", async () => {
+  const upstreamPort = getAvailablePort()!;
+  const upstream = serveHostEcho(upstreamPort);
+  const exposed = exposeHost("svc", { port: upstreamPort, keepHostname: true });
+  try {
+    // Forwarding to the address used would bypass a service bound to loopback.
+    const res = await fetch(`http://127.0.0.1:${exposed.port}/`);
+    assertEquals((await res.json()).host, `svc.localhost:${upstreamPort}`);
+  } finally {
+    await exposed.close();
+    await upstream.shutdown();
+  }
+});
+
+/**
+ * The status line `port` on this machine answers a request for `host` with.
+ * `fetch` overrides Host, hence the hand-written request.
+ */
+const statusLineFor = async (port: number, host: string) => {
+  const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+  try {
+    await conn.write(
+      new TextEncoder().encode(
+        `GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+      ),
+    );
+    const buf = new Uint8Array(1024);
+    const n = await conn.read(buf);
+    return new TextDecoder().decode(buf.subarray(0, n ?? 0)).split("\r\n")[0];
+  } finally {
+    conn.close();
+  }
+};
+
+Deno.test("expose: refuses names, as a rebound DNS name could read the service", async () => {
+  const upstreamPort = getAvailablePort()!;
+  const upstream = serveHostEcho(upstreamPort);
+  const exposed = exposeHost("svc", {
+    port: upstreamPort,
+    keepHostname: false,
+  });
+  try {
+    for (
+      const host of [
+        "attacker.example",
+        "localhost",
+        "1.2.3.4.attacker.example",
+      ]
+    ) {
+      assertEquals(
+        await statusLineFor(exposed.port, `${host}:${exposed.port}`),
+        "HTTP/1.1 403 Forbidden",
+      );
+    }
+    for (const host of ["192.168.1.5", "[fe80::1]"]) {
+      assertEquals(
+        await statusLineFor(exposed.port, `${host}:${exposed.port}`),
+        "HTTP/1.1 200 OK",
+      );
+    }
+  } finally {
+    await exposed.close();
+    await upstream.shutdown();
+  }
+});
+
+Deno.test("expose: serves the one name it allows", async () => {
+  const upstreamPort = getAvailablePort()!;
+  const upstream = serveHostEcho(upstreamPort);
+  const exposed = exposeHost(
+    "svc",
+    { port: upstreamPort, keepHostname: false },
+    "mymac.local",
+  );
+  try {
+    for (const host of ["mymac.local", "MyMac.Local."]) {
+      assertEquals(
+        await statusLineFor(exposed.port, `${host}:${exposed.port}`),
+        "HTTP/1.1 200 OK",
+      );
+    }
+    assertEquals(
+      await statusLineFor(exposed.port, `attacker.example:${exposed.port}`),
+      "HTTP/1.1 403 Forbidden",
+    );
+  } finally {
+    await exposed.close();
+    await upstream.shutdown();
+  }
+});
+
+Deno.test("expose: close stops serving", async () => {
+  const exposed = exposeHost("svc", { port: 1, keepHostname: false });
+  await exposed.close();
+  await assertRejects(() => fetch(`http://127.0.0.1:${exposed.port}/`));
 });
 
 Deno.test("master: unknown proxy host returns 404", async () => {

@@ -5,17 +5,20 @@
  * @module
  */
 
-import { isValidPort } from "./server.ts";
+import { isValidHostname, isValidPort } from "./server.ts";
 
 /** Usage text printed for `--help`. */
 export const USAGE =
-  `Usage: localman [--keep-hostname] [-v|--verbose] <host> <command> [...args]
+  `Usage: localman [--keep-hostname] [--expose[=<name>]] [-v|--verbose] <host> <command> [...args]
 
 Runs <command> and serves it at http://<host>.localhost/, giving it PORT,
 LOCALMAN_HOST and LOCALMAN_URL in its environment.
 
 Options:
   --keep-hostname  Forward <host>.localhost as the Host instead of localhost
+  --expose         Also serve it to the local network, on a port of its own,
+                   at this machine's IP addresses
+  --expose=<name>  Likewise, also at <name>, e.g. mymac.local
   -v, --verbose    Log debug output
   -h, --help       Show this help
 
@@ -32,6 +35,12 @@ export type ParsedArgs = { action: "help" } | {
   host: string;
   /** Preserve the original hostname when forwarding instead of rewriting to `localhost`. */
   keepHostname: boolean;
+  /**
+   * Also serve the service to the local network, on a port of its own, at
+   * this machine's IP addresses and `hostname`, lowercased and without a
+   * trailing dot, as browsers send it. `undefined` doesn't expose it.
+   */
+  expose: { hostname?: string } | undefined;
   /** Emit debug logging. */
   verbose: boolean;
   /** The command to run the service. */
@@ -51,12 +60,21 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
 
   let host: string | undefined;
   let keepHostname = false;
+  let expose: { hostname?: string } | undefined;
   let verbose = false;
   while (args.length && host === undefined) {
     const arg = args.shift()!;
     if (arg === "-h" || arg === "--help") return { action: "help" };
     else if (arg === "--keep-hostname") keepHostname = true;
-    else if (arg === "-v" || arg === "--verbose") verbose = true;
+    else if (arg === "--expose") expose = {};
+    else if (arg.startsWith("--expose=")) {
+      const name = arg.slice("--expose=".length);
+      const hostname = name.toLowerCase().replace(/\.$/, "");
+      if (!isValidHostname(hostname)) {
+        throw new Error(`Invalid host name for --expose: "${name}"`);
+      }
+      expose = { hostname };
+    } else if (arg === "-v" || arg === "--verbose") verbose = true;
     else if (arg.startsWith("-")) throw new Error("Unknown flag name: " + arg);
     else host = arg.toLowerCase().replace(/\.localhost$/, "");
   }
@@ -66,7 +84,15 @@ export const parseArgs = (argv: string[]): ParsedArgs => {
   const command = args.shift();
   if (!command) throw new Error("Missing command to run");
 
-  return { action: "run", host, keepHostname, verbose, command, args };
+  return {
+    action: "run",
+    host,
+    keepHostname,
+    expose,
+    verbose,
+    command,
+    args,
+  };
 };
 
 /**
@@ -100,6 +126,26 @@ export const serviceEnv = (
     localmanPort === 80 ? "" : `:${localmanPort}`
   }`,
 });
+
+/**
+ * The URLs other devices reach an exposed service at on `port`: one at
+ * `hostname` if given, then one per IPv4 address of this machine's
+ * `interfaces`, as reported by `Deno.networkInterfaces()`. Loopback addresses
+ * only reach this machine, and IPv6 ones are left out as a LAN's are commonly
+ * link-local, which a URL can't address without a zone.
+ */
+export const lanUrls = (
+  interfaces: Deno.NetworkInterfaceInfo[],
+  port: number,
+  hostname?: string,
+): string[] => [
+  ...(hostname ? [`http://${hostname}:${port}/`] : []),
+  ...interfaces
+    .filter(({ family, address }) =>
+      family === "IPv4" && !address.startsWith("127.")
+    )
+    .map(({ address }) => `http://${address}:${port}/`),
+];
 
 /**
  * Why localman can't run on `os`, or `undefined` if it can. Only macOS and

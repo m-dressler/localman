@@ -308,7 +308,8 @@ const endOnAbort = (res: Response, signal: AbortSignal): Response => {
 };
 
 /**
- * Forwards a proxied request to the local port named by `config`.
+ * Forwards a proxied request for `host` to the local port named by `config`,
+ * addressed to `<host>.localhost` when it keeps the hostname.
  *
  * `fetch` and `WebSocket` derive `Host` from the upstream URL, so a same-origin `Origin` is
  * mapped to that same upstream origin to keep origin checks consistent, and a
@@ -320,13 +321,14 @@ const endOnAbort = (res: Response, signal: AbortSignal): Response => {
  */
 const forwardRequest = async (
   req: Request,
+  host: string,
   config: HostConfig,
   signal: AbortSignal,
 ): Promise<Response> => {
   const incoming = new URL(req.url);
   const url = new URL(req.url);
   url.port = String(config.port);
-  if (!config.keepHostname) url.hostname = "localhost";
+  url.hostname = config.keepHostname ? `${host}.localhost` : "localhost";
   const headers = new Headers(req.headers);
   headers.set("X-Forwarded-Host", incoming.host);
   headers.set("X-Forwarded-Proto", incoming.protocol.slice(0, -1));
@@ -380,6 +382,11 @@ export const isValidPort = (port: number): boolean =>
 /** A DNS label as browsers send it: lowercase letters, digits, inner hyphens. */
 const DNS_LABEL = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
+/** Whether `name` is a hostname of dot-separated DNS labels, as browsers send it. */
+export const isValidHostname = (name: string): boolean =>
+  name.length <= 253 &&
+  name.split(".").every((label) => DNS_LABEL.test(label));
+
 /**
  * Why `host` and `port` can't be registered, or `undefined` if they can. A host
  * is dot-separated DNS labels in lowercase, as browsers address
@@ -391,10 +398,7 @@ const invalidRegistration = (
   port: number,
   proxyPort: number,
 ): string | undefined => {
-  if (
-    host.length > 243 ||
-    !host.split(".").every((label) => DNS_LABEL.test(label))
-  ) {
+  if (host.length > 243 || !isValidHostname(host)) {
     return `Invalid host name "${host}"; ` +
       `use lowercase DNS labels such as "api" or "api.v2"`;
   }
@@ -648,13 +652,72 @@ async (req, info) => {
     return res;
   }
 
-  const config = state.hosts.get(url.hostname.replace(/\.localhost$/, ""))
-    ?.config;
-  if (config) return forwardRequest(req, config, closing);
+  const host = url.hostname.replace(/\.localhost$/, "");
+  const config = state.hosts.get(host)?.config;
+  if (config) return forwardRequest(req, host, config, closing);
   return Response.json(
     { message: "No host registered for " + url.hostname },
     { status: 404 },
   );
+};
+
+/** Handle returned by {@link exposeHost}. */
+export type ExposedHost = {
+  /** Port the host is served on to the local network. */
+  port: number;
+  /** Stops serving, ending requests still being proxied. */
+  close: () => Promise<void>;
+};
+
+/**
+ * Whether `hostname`, as `URL` normalizes it, is an IP address rather than a
+ * name. `URL` rewrites IPv4 forms such as `0x7f.1` to dotted decimal and
+ * brackets IPv6, so neither a name nor a name starting with digits passes.
+ */
+const isIpAddress = (hostname: string): boolean =>
+  /^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.startsWith("[");
+
+/**
+ * Serves `host` to the local network on a free port of its own, forwarding
+ * requests to the service as the master does. Unlike the master it accepts any
+ * peer and needs no `<host>.localhost` name, which other devices can't resolve.
+ * It belongs to the instance, so it outlives a failover.
+ *
+ * Only requests addressed to an IP address or to `allowedHostname` are
+ * forwarded. Any other name could be an attacker's, rebound to this machine so
+ * their page reads the service as its own origin; the Host rewrite would defeat
+ * the service's own checks against that.
+ */
+export const exposeHost = (
+  host: string,
+  config: HostConfig,
+  allowedHostname?: string,
+): ExposedHost => {
+  const closing = new AbortController();
+  const server = Deno.serve({
+    port: 0,
+    onListen: () => {},
+    handler: (req) => {
+      const hostname = new URL(req.url).hostname.replace(/\.$/, "");
+      if (!isIpAddress(hostname) && hostname !== allowedHostname) {
+        return Response.json(
+          {
+            message: `Localman doesn't serve ${hostname} here; ` +
+              `allow it with --expose=${hostname}`,
+          },
+          { status: 403 },
+        );
+      }
+      return forwardRequest(req, host, config, closing.signal);
+    },
+  });
+  return {
+    port: server.addr.port,
+    close: async () => {
+      closing.abort();
+      await server.shutdown();
+    },
+  };
 };
 
 /**

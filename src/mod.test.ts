@@ -57,6 +57,60 @@ Deno.test("cli: serves its command on LOCALMAN_PORT", async () => {
   }
 });
 
+/** A non-loopback IPv4 address of this machine, if it has one. */
+const lanAddress = Deno.networkInterfaces().find((iface) =>
+  iface.family === "IPv4" && !iface.address.startsWith("127.")
+)?.address;
+
+Deno.test({
+  name: "cli: --expose prints where the network reaches its command",
+  ignore: !lanAddress,
+  fn: async () => {
+    const cli = spawnCli(String(getAvailablePort()), [
+      "--expose",
+      "svc",
+      Deno.execPath(),
+      "run",
+      "-A",
+      ECHO_SERVER,
+    ]);
+    const stdout = cli.stdout.cancel();
+    const lines = cli.stderr.pipeThrough(new TextDecoderStream()).getReader();
+    // The service shares stderr, so it stays open after localman is gone.
+    const deadline = Promise.withResolvers<never>();
+    const timeout = setTimeout(
+      () => deadline.reject(new Error("No exposed URL")),
+      10_000,
+    );
+    try {
+      let stderr = "";
+      const urlPattern = new RegExp(`http://${lanAddress}:\\d+/`);
+      while (!urlPattern.test(stderr)) {
+        const { done, value } = await Promise.race([
+          lines.read(),
+          deadline.promise,
+        ]);
+        if (done) throw new Error(`No exposed URL in: ${stderr}`);
+        stderr += value;
+      }
+      assertMatch(
+        await fetchWhenUp(stderr.match(urlPattern)![0] + "hi"),
+        /^\{"url":"http:\/\/localhost:\d+\/hi"\}$/,
+      );
+    } finally {
+      clearTimeout(timeout);
+      try {
+        cli.kill("SIGTERM");
+      } catch {
+        // Already exited, e.g. having failed to start.
+      }
+      await lines.cancel();
+      await stdout;
+      await cli.status;
+    }
+  },
+});
+
 Deno.test("cli: an invalid LOCALMAN_PORT is refused", async () => {
   const { code, stderr } = await spawnCli("nope", ["svc", "true"]).output();
   assertEquals(code, 1);

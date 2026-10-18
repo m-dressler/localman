@@ -13,6 +13,7 @@
 
 import { getAvailablePort } from "@std/net/get-available-port";
 import {
+  lanUrls,
   parseArgs,
   parseLocalmanPort,
   serviceEnv,
@@ -20,7 +21,7 @@ import {
   USAGE,
 } from "./cli.ts";
 import { runCommand } from "./command.ts";
-import { createServer } from "./server.ts";
+import { createServer, exposeHost } from "./server.ts";
 
 /**
  * Exit codes for the signals that stop localman: 128 + the signal's number, as
@@ -43,7 +44,7 @@ if (import.meta.main) {
     console.log(USAGE);
     Deno.exit(0);
   }
-  const { host, keepHostname, verbose, command, args } = parsed;
+  const { host, keepHostname, expose, verbose, command, args } = parsed;
   if (!verbose) console.debug = () => {};
   else console.debug = console.debug.bind(console, "$ localman:");
 
@@ -89,6 +90,25 @@ if (import.meta.main) {
   // A host that can't be served, e.g. as it's taken or the master's port is
   // held by something else, doesn't start its service at all.
   await server.registerHost(host, { port, keepHostname }).catch(fail);
+  const exposed = expose
+    ? exposeHost(host, { port, keepHostname }, expose.hostname)
+    : undefined;
+  if (exposed) {
+    const urls = lanUrls(
+      Deno.networkInterfaces(),
+      exposed.port,
+      expose?.hostname,
+    );
+    if (!urls.length) {
+      console.error(
+        `localman: exposed ${host}.localhost on port ${exposed.port}, ` +
+          "but this machine has no network address",
+      );
+    }
+    for (const url of urls) {
+      console.error(`localman: exposed ${host}.localhost at ${url}`);
+    }
+  }
   process = runCommand([command, ...args], {
     env: serviceEnv(host, port, localmanPort),
   });
@@ -108,7 +128,7 @@ if (import.meta.main) {
       // Already exited.
     }
     await server.unregisterHost(host);
-    await server.close();
+    await Promise.all([server.close(), exposed?.close()]);
     Deno.exit(code);
   };
 

@@ -18,7 +18,7 @@ Localman supports macOS and Linux. It refuses to start on Windows.
 ## Usage
 
 ```
-localman [--keep-hostname] [-v|--verbose] <host> <command> [...args]
+localman [--keep-hostname] [--expose[=<name>]] [-v|--verbose] <host> <command> [...args]
 localman --help
 ```
 
@@ -64,6 +64,32 @@ Either way, a same-origin `Origin` header is rewritten to match the forwarded
 `Host`, so origin checks (e.g. CSRF protection) pass. A foreign `Origin` is left
 untouched. The address the client used is available in `X-Forwarded-Host` and
 `X-Forwarded-Proto`.
+
+Pass `--expose` to also serve a service to the local network, e.g. to try it on
+a phone. Other devices can't resolve `<host>.localhost`, so the service gets a
+free port of its own on every interface, and localman prints where it's reached:
+
+```sh
+$ localman --expose web npm run dev -- --port \$PORT
+localman: exposed web.localhost at http://192.168.1.5:61234/
+```
+
+Requests there are forwarded like those to `web.localhost`, with `Host`
+rewritten to `localhost`, or to `web.localhost` with `--keep-hostname`. The port
+changes from run to run. Anyone on the network can reach an exposed service, so
+leave it off on networks you don't trust. Only exposed services accept other
+devices; the proxy on port `80` refuses them.
+
+An exposed service only answers requests addressed to an IP address, and refuses
+names with `403`: any name could be a malicious site's, pointed at your machine
+so its pages can read the service. To reach it by a name, such as the machine's
+`.local` name or a tunnel's domain, allow that one with `--expose=<name>`:
+
+```sh
+$ localman --expose=mymac.local web npm run dev -- --port \$PORT
+localman: exposed web.localhost at http://mymac.local:61234/
+localman: exposed web.localhost at http://192.168.1.5:61234/
+```
 
 > macOS lets any user bind port `80`. On Linux it takes elevated privileges,
 > e.g. `sudo sysctl net.ipv4.ip_unprivileged_port_start=80`, or use

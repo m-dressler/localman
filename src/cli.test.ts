@@ -5,6 +5,7 @@ import {
   assertThrows,
 } from "@std/assert";
 import {
+  lanUrls,
   parseArgs,
   parseLocalmanPort,
   serviceEnv,
@@ -23,6 +24,7 @@ Deno.test("parseArgs: host, command and command args", () => {
     action: "run",
     host: "app",
     keepHostname: false,
+    expose: undefined,
     verbose: false,
     command: "deno",
     args: ["run", "-A", "x.ts"],
@@ -61,6 +63,58 @@ Deno.test("parseLocalmanPort: refuses anything else", () => {
   for (const value of ["nope", "0", "65536", "80.5", "0x1F90", "8e3", " 80 "]) {
     assertThrows(() => parseLocalmanPort(value), Error, "LOCALMAN_PORT");
   }
+});
+
+Deno.test("parseArgs: --expose", () => {
+  assertEquals(parseRun(["--expose", "app", "server"]).expose, {});
+  assertEquals(parseRun(["app", "server", "--expose"]).expose, undefined);
+});
+
+Deno.test("parseArgs: --expose=<name> allows a name, as browsers send it", () => {
+  assertEquals(parseRun(["--expose=MyMac.Local.", "app", "server"]).expose, {
+    hostname: "mymac.local",
+  });
+});
+
+Deno.test("parseArgs: --expose=<name> refuses anything but a host name", () => {
+  for (const name of ["", "mymac.local:8080", "http://mymac.local", "my_mac"]) {
+    assertThrows(
+      () => parseArgs([`--expose=${name}`, "app", "server"]),
+      Error,
+      "Invalid host name for --expose",
+    );
+  }
+});
+
+Deno.test("lanUrls: one URL per IPv4 network address", () => {
+  /** An interface entry with only the fields that matter here. */
+  const iface = (
+    family: "IPv4" | "IPv6",
+    address: string,
+  ): Deno.NetworkInterfaceInfo => ({
+    family,
+    address,
+    name: "en0",
+    netmask: "",
+    scopeid: null,
+    cidr: "",
+    mac: "",
+  });
+  assertEquals(
+    lanUrls([
+      iface("IPv4", "127.0.0.1"),
+      iface("IPv6", "::1"),
+      iface("IPv4", "192.168.1.5"),
+      // IPv6 addresses on a LAN are commonly link-local, unusable in a URL.
+      iface("IPv6", "fe80::1"),
+      iface("IPv4", "10.0.0.2"),
+    ], 61234),
+    ["http://192.168.1.5:61234/", "http://10.0.0.2:61234/"],
+  );
+  assertEquals(
+    lanUrls([iface("IPv4", "192.168.1.5")], 61234, "mymac.local"),
+    ["http://mymac.local:61234/", "http://192.168.1.5:61234/"],
+  );
 });
 
 Deno.test("parseArgs: --verbose alias", () => {
