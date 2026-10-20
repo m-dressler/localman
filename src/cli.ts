@@ -128,26 +128,6 @@ export const serviceEnv = (
 });
 
 /**
- * The URLs other devices reach an exposed service at on `port`: one at
- * `hostname` if given, then one per IPv4 address of this machine's
- * `interfaces`, as reported by `Deno.networkInterfaces()`. Loopback addresses
- * only reach this machine, and IPv6 ones are left out as a LAN's are commonly
- * link-local, which a URL can't address without a zone.
- */
-export const lanUrls = (
-  interfaces: Deno.NetworkInterfaceInfo[],
-  port: number,
-  hostname?: string,
-): string[] => [
-  ...(hostname ? [`http://${hostname}:${port}/`] : []),
-  ...interfaces
-    .filter(({ family, address }) =>
-      family === "IPv4" && !address.startsWith("127.")
-    )
-    .map(({ address }) => `http://${address}:${port}/`),
-];
-
-/**
  * Why localman can't run on `os`, or `undefined` if it can. Only macOS and
  * Linux are supported: Windows lacks the signals, the command resolution and
  * the `*.localhost` resolution localman relies on.

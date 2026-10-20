@@ -66,7 +66,8 @@ Deno.test({
   name: "cli: --expose prints where the network reaches its command",
   ignore: !lanAddress,
   fn: async () => {
-    const cli = spawnCli(String(getAvailablePort()), [
+    const port = getAvailablePort()!;
+    const cli = spawnCli(String(port), [
       "--expose",
       "svc",
       Deno.execPath(),
@@ -93,10 +94,18 @@ Deno.test({
         if (done) throw new Error(`No exposed URL in: ${stderr}`);
         stderr += value;
       }
+      const exposedUrl = stderr.match(urlPattern)![0];
       assertMatch(
-        await fetchWhenUp(stderr.match(urlPattern)![0] + "hi"),
+        await fetchWhenUp(exposedUrl + "hi"),
         /^\{"url":"http:\/\/localhost:\d+\/hi"\}$/,
       );
+      // The master learns where it's exposed, to list it.
+      const res = await fetch(`http://localhost:${port}/`, {
+        headers: { Accept: "application/json" },
+      });
+      assertEquals((await res.json()).svc.exposed, {
+        port: Number(new URL(exposedUrl).port),
+      });
     } finally {
       clearTimeout(timeout);
       try {

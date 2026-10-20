@@ -1,6 +1,6 @@
-import { assertEquals, assertRejects } from "@std/assert";
+import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import { getAvailablePort } from "@std/net";
-import { createServer, exposeHost } from "./server.ts";
+import { createServer, exposeHost, lanUrls } from "./server.ts";
 
 // Keep test output focused on assertions, not the instances' debug logging.
 console.debug = () => {};
@@ -54,6 +54,31 @@ Deno.test("master: root negotiates HTML when preferred", async () => {
     const html = await res.text();
     // Links must reach the host on whichever port the master listens on.
     assertEquals(html.includes(`href="http://app.localhost:${port}/"`), true);
+    // Where hosts are exposed is only shown once one is.
+    assertEquals(html.includes("Exposed"), false);
+  } finally {
+    await server.close();
+  }
+});
+
+Deno.test("master: root links exposed hosts where the network reaches them", async () => {
+  const port = getAvailablePort()!;
+  const server = createServer({ port });
+  try {
+    await server.registerHost("app", {
+      port: 4002,
+      keepHostname: false,
+      exposed: { port: 61234, hostname: "mymac.local" },
+    });
+    await server.registerHost("api", { port: 4003, keepHostname: false });
+    const res = await fetch(`http://localhost:${port}/`, {
+      headers: { Accept: "text/html" },
+    });
+    const html = await res.text();
+    assertStringIncludes(html, `href="http://mymac.local:61234/"`);
+    if (lanAddress) {
+      assertStringIncludes(html, `href="http://${lanAddress}:61234/"`);
+    }
   } finally {
     await server.close();
   }
@@ -559,24 +584,38 @@ Deno.test("expose: --keep-hostname forwards <host>.localhost, not the address", 
 });
 
 /**
- * The status line `port` on this machine answers a request for `host` with.
- * `fetch` overrides Host, hence the hand-written request.
+ * The raw response `port` gives a GET for `path` addressed to `host`, sent
+ * from this machine's `address`. `fetch` overrides Host, hence the
+ * hand-written request.
  */
-const statusLineFor = async (port: number, host: string) => {
-  const conn = await Deno.connect({ hostname: "127.0.0.1", port });
+const rawGet = async (
+  address: string,
+  port: number,
+  host: string,
+  path = "/",
+): Promise<string> => {
+  const conn = await Deno.connect({ hostname: address, port });
   try {
     await conn.write(
       new TextEncoder().encode(
-        `GET / HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
+        `GET ${path} HTTP/1.1\r\nHost: ${host}\r\nConnection: close\r\n\r\n`,
       ),
     );
-    const buf = new Uint8Array(1024);
-    const n = await conn.read(buf);
-    return new TextDecoder().decode(buf.subarray(0, n ?? 0)).split("\r\n")[0];
+    const decoder = new TextDecoder();
+    const buf = new Uint8Array(4096);
+    let response = "";
+    for (let n; (n = await conn.read(buf)) !== null;) {
+      response += decoder.decode(buf.subarray(0, n), { stream: true });
+    }
+    return response;
   } finally {
     conn.close();
   }
 };
+
+/** The status line `port` on this machine answers a request for `host` with. */
+const statusLineFor = async (port: number, host: string) =>
+  (await rawGet("127.0.0.1", port, host)).split("\r\n")[0];
 
 Deno.test("expose: refuses names, as a rebound DNS name could read the service", async () => {
   const upstreamPort = getAvailablePort()!;
@@ -639,6 +678,120 @@ Deno.test("expose: close stops serving", async () => {
   const exposed = exposeHost("svc", { port: 1, keepHostname: false });
   await exposed.close();
   await assertRejects(() => fetch(`http://127.0.0.1:${exposed.port}/`));
+});
+
+Deno.test({
+  name:
+    "master: lists exposed hosts to other devices, at the address they used",
+  ignore: !lanAddress,
+  fn: async () => {
+    const port = getAvailablePort()!;
+    const server = createServer({ port });
+    try {
+      await server.registerHost("web", {
+        port: 5001,
+        keepHostname: false,
+        exposed: { port: 61234, hostname: "mymac.local" },
+      });
+      await server.registerHost("app", {
+        port: 5002,
+        keepHostname: false,
+        exposed: { port: 61235 },
+      });
+      await server.registerHost("api", { port: 5003, keepHostname: false });
+
+      const byAddress = await rawGet(
+        lanAddress!,
+        port,
+        `${lanAddress}:${port}`,
+      );
+      assertEquals(byAddress.split("\r\n")[0], "HTTP/1.1 200 OK");
+      assertStringIncludes(byAddress, `href="http://${lanAddress}:61234/"`);
+      assertStringIncludes(byAddress, `href="http://${lanAddress}:61235/"`);
+      // Hosts that aren't exposed stay private to this machine.
+      assertEquals(byAddress.includes(">api<"), false);
+
+      // A name reaches the listing only of the hosts that allow it.
+      const byName = await rawGet(lanAddress!, port, `mymac.local:${port}`);
+      assertEquals(byName.split("\r\n")[0], "HTTP/1.1 200 OK");
+      assertStringIncludes(byName, `href="http://mymac.local:61234/"`);
+      assertEquals(byName.includes(">app<"), false);
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test({
+  name: "master: other devices get nothing but the listing of exposed hosts",
+  ignore: !lanAddress,
+  fn: async () => {
+    const port = getAvailablePort()!;
+    const server = createServer({ port });
+    const statusFromLan = async (host: string, path = "/") =>
+      (await rawGet(lanAddress!, port, host, path)).split("\r\n")[0];
+    try {
+      await server.registerHost("web", { port: 5001, keepHostname: false });
+      assertEquals(
+        await statusFromLan(`${lanAddress}:${port}`),
+        "HTTP/1.1 403 Forbidden",
+      );
+
+      await server.registerHost("web", {
+        port: 5001,
+        keepHostname: false,
+        exposed: { port: 61234, hostname: "mymac.local" },
+      });
+      const refused = [
+        [`${lanAddress}:${port}`, "/hosts/web"],
+        [`${lanAddress}:${port}`, "/wait"],
+        [`localhost:${port}`, "/"],
+        [`web.localhost:${port}`, "/"],
+        // A rebound name could read the listing as its own origin.
+        [`attacker.example:${port}`, "/"],
+      ];
+      for (const [host, path] of refused) {
+        assertEquals(
+          await statusFromLan(host, path),
+          "HTTP/1.1 403 Forbidden",
+          host + path,
+        );
+      }
+    } finally {
+      await server.close();
+    }
+  },
+});
+
+Deno.test("lanUrls: one URL per IPv4 network address", () => {
+  /** An interface entry with only the fields that matter here. */
+  const iface = (
+    family: "IPv4" | "IPv6",
+    address: string,
+  ): Deno.NetworkInterfaceInfo => ({
+    family,
+    address,
+    name: "en0",
+    netmask: "",
+    scopeid: null,
+    cidr: "",
+    mac: "",
+  });
+  assertEquals(
+    lanUrls([
+      iface("IPv4", "127.0.0.1"),
+      iface("IPv6", "::1"),
+      iface("IPv4", "192.168.1.5"),
+      // IPv6 addresses on a LAN are commonly link-local, unusable in a URL.
+      iface("IPv6", "fe80::1"),
+      iface("IPv4", "10.0.0.2"),
+    ], 61234),
+    ["http://192.168.1.5:61234/", "http://10.0.0.2:61234/"],
+  );
+  assertEquals(
+    lanUrls([iface("IPv4", "192.168.1.5")], 61234, "mymac.local"),
+    ["http://mymac.local:61234/", "http://192.168.1.5:61234/"],
+  );
 });
 
 Deno.test("master: unknown proxy host returns 404", async () => {
@@ -934,6 +1087,35 @@ Deno.test("client: registering an owned host again updates it", async () => {
   }
 });
 
+Deno.test("client: registers where its host is exposed", async () => {
+  const port = getAvailablePort()!;
+  const master = createServer({ port });
+  const client = createServer({ port });
+  try {
+    await client.registerHost("web", {
+      port: 5001,
+      keepHostname: false,
+      exposed: { port: 61234, hostname: "mymac.local" },
+    });
+    await client.registerHost("api", {
+      port: 5002,
+      keepHostname: false,
+      exposed: { port: 61235 },
+    });
+    assertEquals(await listHosts(port), {
+      web: {
+        port: 5001,
+        keepHostname: false,
+        exposed: { port: 61234, hostname: "mymac.local" },
+      },
+      api: { port: 5002, keepHostname: false, exposed: { port: 61235 } },
+    });
+  } finally {
+    await client.close();
+    await master.close();
+  }
+});
+
 Deno.test("client: a host owned by a live client can't be taken", async () => {
   const port = getAvailablePort()!;
   const master = createServer({ port });
@@ -998,6 +1180,47 @@ Deno.test("master: only canonical host names and real ports register", async () 
     assertEquals(await listHosts(port), {
       "api.v2": { port: 5001, keepHostname: false },
     });
+  } finally {
+    await server.close();
+  }
+});
+
+Deno.test("master: only a real port and host name expose a host", async () => {
+  const port = getAvailablePort()!;
+  const server = createServer({ port });
+  try {
+    const badExposures = [
+      null,
+      "yes",
+      { port: 0 },
+      { port: 65536 },
+      { port: "61234" },
+      { port: 61234, hostname: "My_Mac" },
+      { port: 61234, hostname: 5 },
+    ];
+    for (const exposed of badExposures) {
+      const res = await fetch(`http://localhost:${port}/hosts/api`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Localman-Instance": "test",
+        },
+        body: JSON.stringify({ port: 5001, exposed }),
+      });
+      await res.body?.cancel();
+      assertEquals(res.status, 400, JSON.stringify(exposed));
+    }
+    await assertRejects(
+      () =>
+        server.registerHost("api", {
+          port: 5001,
+          keepHostname: false,
+          exposed: { port: 61234, hostname: "my_mac" },
+        }),
+      Error,
+      "Invalid",
+    );
+    assertEquals(await listHosts(port), {});
   } finally {
     await server.close();
   }

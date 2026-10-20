@@ -5,7 +5,6 @@ import {
   assertThrows,
 } from "@std/assert";
 import {
-  lanUrls,
   parseArgs,
   parseLocalmanPort,
   serviceEnv,
@@ -84,37 +83,6 @@ Deno.test("parseArgs: --expose=<name> refuses anything but a host name", () => {
       "Invalid host name for --expose",
     );
   }
-});
-
-Deno.test("lanUrls: one URL per IPv4 network address", () => {
-  /** An interface entry with only the fields that matter here. */
-  const iface = (
-    family: "IPv4" | "IPv6",
-    address: string,
-  ): Deno.NetworkInterfaceInfo => ({
-    family,
-    address,
-    name: "en0",
-    netmask: "",
-    scopeid: null,
-    cidr: "",
-    mac: "",
-  });
-  assertEquals(
-    lanUrls([
-      iface("IPv4", "127.0.0.1"),
-      iface("IPv6", "::1"),
-      iface("IPv4", "192.168.1.5"),
-      // IPv6 addresses on a LAN are commonly link-local, unusable in a URL.
-      iface("IPv6", "fe80::1"),
-      iface("IPv4", "10.0.0.2"),
-    ], 61234),
-    ["http://192.168.1.5:61234/", "http://10.0.0.2:61234/"],
-  );
-  assertEquals(
-    lanUrls([iface("IPv4", "192.168.1.5")], 61234, "mymac.local"),
-    ["http://mymac.local:61234/", "http://192.168.1.5:61234/"],
-  );
 });
 
 Deno.test("parseArgs: --verbose alias", () => {

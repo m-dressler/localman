@@ -13,7 +13,6 @@
 
 import { getAvailablePort } from "@std/net/get-available-port";
 import {
-  lanUrls,
   parseArgs,
   parseLocalmanPort,
   serviceEnv,
@@ -21,7 +20,7 @@ import {
   USAGE,
 } from "./cli.ts";
 import { runCommand } from "./command.ts";
-import { createServer, exposeHost } from "./server.ts";
+import { createServer, exposeHost, lanUrls } from "./server.ts";
 
 /**
  * Exit codes for the signals that stop localman: 128 + the signal's number, as
@@ -87,12 +86,17 @@ if (import.meta.main) {
   });
 
   const port = Number(Deno.env.get("PORT")) || getAvailablePort();
-  // A host that can't be served, e.g. as it's taken or the master's port is
-  // held by something else, doesn't start its service at all.
-  await server.registerHost(host, { port, keepHostname }).catch(fail);
+  // Exposed before registering, so the master learns where to list it.
   const exposed = expose
     ? exposeHost(host, { port, keepHostname }, expose.hostname)
     : undefined;
+  // A host that can't be served, e.g. as it's taken or the master's port is
+  // held by something else, doesn't start its service at all.
+  await server.registerHost(host, {
+    port,
+    keepHostname,
+    exposed: exposed && { port: exposed.port, hostname: expose?.hostname },
+  }).catch(fail);
   if (exposed) {
     const urls = lanUrls(
       Deno.networkInterfaces(),

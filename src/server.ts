@@ -9,6 +9,12 @@ export type HostConfig = {
    * forwarding; otherwise it is rewritten to `localhost`.
    */
   keepHostname: boolean;
+  /**
+   * Where {@link exposeHost} also serves the host to the local network: its
+   * port there, and the one name it answers at besides IP addresses.
+   * `undefined` when it isn't exposed.
+   */
+  exposed?: { port: number; hostname?: string };
 };
 
 /** Options for {@link createServer}. */
@@ -388,14 +394,15 @@ export const isValidHostname = (name: string): boolean =>
   name.split(".").every((label) => DNS_LABEL.test(label));
 
 /**
- * Why `host` and `port` can't be registered, or `undefined` if they can. A host
- * is dot-separated DNS labels in lowercase, as browsers address
+ * Why `host` and `config` can't be registered, or `undefined` if they can. A
+ * host is dot-separated DNS labels in lowercase, as browsers address
  * `<host>.localhost`, and short enough to keep that a valid hostname. The port
- * can't be `proxyPort`, which would loop requests back into the proxy.
+ * can't be `proxyPort`, which would loop requests back into the proxy. Where
+ * it's exposed must be a real port and, if named, a hostname as browsers send it.
  */
 const invalidRegistration = (
   host: string,
-  port: number,
+  { port, exposed }: HostConfig,
   proxyPort: number,
 ): string | undefined => {
   if (host.length > 243 || !isValidHostname(host)) {
@@ -408,7 +415,34 @@ const invalidRegistration = (
   if (port === proxyPort) {
     return `Port ${port} is localman's own port; give the service another one`;
   }
+  if (exposed && !isValidPort(exposed.port)) {
+    return `Invalid exposed port ${exposed.port}; use 1 to 65535`;
+  }
+  if (exposed?.hostname !== undefined && !isValidHostname(exposed.hostname)) {
+    return `Invalid exposed host name "${exposed.hostname}"; ` +
+      `use lowercase DNS labels such as "mymac.local"`;
+  }
   return undefined;
+};
+
+/**
+ * The `exposed` field of a registration body, keeping only what a
+ * {@link HostConfig} knows of it, or `null` if it isn't of that shape.
+ */
+const parseExposed = (value: unknown): HostConfig["exposed"] | null => {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "object" || value === null || !("port" in value) ||
+    typeof value.port !== "number"
+  ) {
+    return null;
+  }
+  if (!("hostname" in value) || value.hostname === undefined) {
+    return { port: value.port };
+  }
+  return typeof value.hostname === "string"
+    ? { port: value.port, hostname: value.hostname }
+    : null;
 };
 
 /** Refusal for a host another instance holds. */
@@ -473,20 +507,25 @@ const handleRegister = async (
   }
 
   const { port, keepHostname = false } = body;
-  if (typeof port !== "number" || typeof keepHostname !== "boolean") {
+  const exposed = parseExposed(body.exposed);
+  if (
+    typeof port !== "number" || typeof keepHostname !== "boolean" ||
+    exposed === null
+  ) {
     return Response.json(
       {
-        message:
-          "Request body must be of type `{port:number,keepHostname?:boolean}`",
+        message: "Request body must be of type " +
+          "`{port:number,keepHostname?:boolean,exposed?:{port:number,hostname?:string}}`",
       },
       { status: 400 },
     );
   }
 
-  const invalid = invalidRegistration(host, port, proxyPort);
+  const config = { port, keepHostname, exposed };
+  const invalid = invalidRegistration(host, config, proxyPort);
   if (invalid) return Response.json({ message: invalid }, { status: 400 });
 
-  if (!claimHost(state, host, owner, { port, keepHostname })) {
+  if (!claimHost(state, host, owner, config)) {
     return Response.json({ message: HOST_TAKEN }, { status: 409 });
   }
   return new Response(null, { status: 204 });
@@ -539,6 +578,48 @@ const handleWait = (owner: string, state: HandlerState): Response => {
   return new Response(body, { headers: { "Content-Type": "text/plain" } });
 };
 
+/**
+ * Whether `hostname`, as `URL` normalizes it, is an IP address rather than a
+ * name. `URL` rewrites IPv4 forms such as `0x7f.1` to dotted decimal and
+ * brackets IPv6, so neither a name nor a name starting with digits passes.
+ */
+const isIpAddress = (hostname: string): boolean =>
+  /^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.startsWith("[");
+
+/**
+ * The URLs other devices reach an exposed service at on `port`: one at
+ * `hostname` if given, then one per IPv4 address of this machine's
+ * `interfaces`, as reported by `Deno.networkInterfaces()`. Loopback addresses
+ * only reach this machine, and IPv6 ones are left out as a LAN's are commonly
+ * link-local, which a URL can't address without a zone.
+ */
+export const lanUrls = (
+  interfaces: Deno.NetworkInterfaceInfo[],
+  port: number,
+  hostname?: string,
+): string[] => [
+  ...(hostname ? [`http://${hostname}:${port}/`] : []),
+  ...interfaces
+    .filter(({ family, address }) =>
+      family === "IPv4" && !address.startsWith("127.")
+    )
+    .map(({ address }) => `http://${address}:${port}/`),
+];
+
+/** The hostname `req` is addressed to, as `URL` normalizes it, less any trailing dot. */
+const requestHostname = (req: Request): string =>
+  new URL(req.url).hostname.replace(/\.$/, "");
+
+/**
+ * Whether a host exposed with `allowedHostname` answers at `hostname`, as
+ * {@link requestHostname} gives it: at any IP address, and at that one name.
+ * Any other name could be an attacker's, rebound to this machine so their page
+ * reads the service as its own origin; the Host rewrite would defeat the
+ * service's own checks against that.
+ */
+const isExposedAt = (hostname: string, allowedHostname?: string): boolean =>
+  isIpAddress(hostname) || hostname === allowedHostname;
+
 /** Handles `GET /` — lists registered hosts as HTML or JSON per `Accept`. */
 const handleRoot = (req: Request, state: HandlerState): Response => {
   // Links go through the port the master was reached on.
@@ -551,14 +632,28 @@ const handleRoot = (req: Request, state: HandlerState): Response => {
     acceptContent.indexOf(contentType) + 1 || Number.MAX_SAFE_INTEGER;
 
   if (acceptPreference("text/html") < acceptPreference("application/json")) {
+    const anyExposed = Array.from(state.hosts.values())
+      .some(({ config }) => config.exposed);
+    const interfaces = anyExposed ? Deno.networkInterfaces() : [];
+    /** Links to where the network reaches `exposed`, one per line. */
+    const exposedLinks = (exposed: HostConfig["exposed"]) =>
+      exposed
+        ? lanUrls(interfaces, exposed.port, exposed.hostname)
+          .map((url) => `<a href="${url}">${url}</a>`)
+          .join("<br>")
+        : "";
     return new Response(
-      `<table><thead><tr><th>Host</th><th>Port</th></tr></thead><tbody>${
+      `<table><thead><tr><th>Host</th><th>Port</th>${
+        anyExposed ? "<th>Exposed at</th>" : ""
+      }</tr></thead><tbody>${
         Array.from(
           state.hosts.entries(),
         )
           .map(
             ([host, { config }]) =>
-              `<tr><td><a href="http://${host}.localhost${portSuffix}/">${host}</a></td><td>${config.port}</td></tr>`,
+              `<tr><td><a href="http://${host}.localhost${portSuffix}/">${host}</a></td><td>${config.port}</td>${
+                anyExposed ? `<td>${exposedLinks(config.exposed)}</td>` : ""
+              }</tr>`,
           )
           .join("")
       }</tbody></table>`,
@@ -619,6 +714,38 @@ const handleLocalmanRequest = (
   );
 };
 
+/**
+ * Handles a request from another device. It may only `GET /` a list of the
+ * exposed hosts that answer at the address or name it used, each linked there;
+ * anything else is refused, as is a list that would be empty.
+ */
+const handleLanRequest = (req: Request, state: HandlerState): Response => {
+  const hostname = requestHostname(req);
+  const exposed = req.method === "GET" && new URL(req.url).pathname === "/"
+    ? Array.from(state.hosts).flatMap(([host, { config }]) =>
+      config.exposed && isExposedAt(hostname, config.exposed.hostname)
+        ? [{ host, url: `http://${hostname}:${config.exposed.port}/` }]
+        : []
+    )
+    : [];
+  if (!exposed.length) {
+    return Response.json(
+      { message: "Localman only accepts connections from this machine" },
+      { status: 403 },
+    );
+  }
+  return new Response(
+    `<table><thead><tr><th>Host</th><th>URL</th></tr></thead><tbody>${
+      exposed
+        .map(({ host, url }) =>
+          `<tr><td>${host}</td><td><a href="${url}">${url}</a></td></tr>`
+        )
+        .join("")
+    }</tbody></table>`,
+    { headers: { "Content-Type": "text/html" } },
+  );
+};
+
 /** Whether `hostname` is an IPv4 (`127.0.0.0/8`) or IPv6 (`::1`) loopback address. */
 const isLoopback = (hostname: string): boolean =>
   hostname.startsWith("127.") || hostname === "::1";
@@ -629,8 +756,8 @@ const isLoopback = (hostname: string): boolean =>
  * it never stands in for that port.
  *
  * The port is bound on all interfaces, since macOS only lets unprivileged users
- * bind port 80 that way, so peers other than this machine are refused here.
- * Aborting `closing` ends the requests it is still proxying.
+ * bind port 80 that way, so peers other than this machine only get the list of
+ * exposed hosts. Aborting `closing` ends the requests it is still proxying.
  */
 const createHandler = (
   state: HandlerState,
@@ -639,10 +766,7 @@ const createHandler = (
 ): Deno.ServeHandler<Deno.NetAddr> =>
 async (req, info) => {
   if (!isLoopback(info.remoteAddr.hostname)) {
-    return Response.json(
-      { message: "Localman only accepts connections from this machine" },
-      { status: 403 },
-    );
+    return handleLanRequest(req, state);
   }
 
   const url = new URL(req.url);
@@ -670,23 +794,13 @@ export type ExposedHost = {
 };
 
 /**
- * Whether `hostname`, as `URL` normalizes it, is an IP address rather than a
- * name. `URL` rewrites IPv4 forms such as `0x7f.1` to dotted decimal and
- * brackets IPv6, so neither a name nor a name starting with digits passes.
- */
-const isIpAddress = (hostname: string): boolean =>
-  /^\d+\.\d+\.\d+\.\d+$/.test(hostname) || hostname.startsWith("[");
-
-/**
  * Serves `host` to the local network on a free port of its own, forwarding
  * requests to the service as the master does. Unlike the master it accepts any
  * peer and needs no `<host>.localhost` name, which other devices can't resolve.
  * It belongs to the instance, so it outlives a failover.
  *
  * Only requests addressed to an IP address or to `allowedHostname` are
- * forwarded. Any other name could be an attacker's, rebound to this machine so
- * their page reads the service as its own origin; the Host rewrite would defeat
- * the service's own checks against that.
+ * forwarded; see {@link isExposedAt}.
  */
 export const exposeHost = (
   host: string,
@@ -698,8 +812,8 @@ export const exposeHost = (
     port: 0,
     onListen: () => {},
     handler: (req) => {
-      const hostname = new URL(req.url).hostname.replace(/\.$/, "");
-      if (!isIpAddress(hostname) && hostname !== allowedHostname) {
+      const hostname = requestHostname(req);
+      if (!isExposedAt(hostname, allowedHostname)) {
         return Response.json(
           {
             message: `Localman doesn't serve ${hostname} here; ` +
@@ -869,7 +983,7 @@ export const createServer = (options: ServerOptions = {}): LocalmanServer => {
 
   return {
     registerHost: async (host, config) => {
-      const invalid = invalidRegistration(host, config.port, port);
+      const invalid = invalidRegistration(host, config, port);
       if (invalid) throw new Error(invalid);
       // Never register with a master before knowing it can be worked with.
       await ready.promise;

@@ -77,8 +77,12 @@ localman: exposed web.localhost at http://192.168.1.5:61234/
 Requests there are forwarded like those to `web.localhost`, with `Host`
 rewritten to `localhost`, or to `web.localhost` with `--keep-hostname`. The port
 changes from run to run. Anyone on the network can reach an exposed service, so
-leave it off on networks you don't trust. Only exposed services accept other
-devices; the proxy on port `80` refuses them.
+leave it off on networks you don't trust.
+
+Other devices can't use the proxy on port `80`, but while any service is exposed
+they can open `http://<address>/`, e.g. `http://192.168.1.5/`, for a list of
+links to the exposed services. `http://localhost/` lists where each one is
+exposed, too.
 
 An exposed service only answers requests addressed to an IP address, and refuses
 names with `403`: any name could be a malicious site's, pointed at your machine
