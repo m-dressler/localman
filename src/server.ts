@@ -294,6 +294,46 @@ const rewriteLocation = (
   });
 };
 
+/** Content codings Deno's `fetch` undoes on its own; others arrive still encoded. */
+const fetchDecodedEncodings = new Set(["gzip", "br"]);
+
+/**
+ * Whether Deno's `fetch` leaves a response to a request with `headers` encoded:
+ * it decodes nothing for a range, nor for an `Accept-Encoding` of only `identity`,
+ * even when an upstream sends an encoding regardless.
+ */
+const fetchSkipsDecoding = (headers: Headers): boolean =>
+  headers.has("Range") ||
+  headers.get("Accept-Encoding")?.toLowerCase() === "identity";
+
+/**
+ * Drops the headers describing an encoding `fetch` has already undone for a
+ * request with `requestHeaders`. `fetch` decodes the body yet keeps
+ * `Content-Encoding` and the encoded `Content-Length`, so passing them on would
+ * have the client decode plain bytes a second time and cut them off at the
+ * encoded size.
+ */
+const dropDecodedEncoding = (
+  res: Response,
+  requestHeaders: Headers,
+): Response => {
+  const encoding = res.headers.get("Content-Encoding")?.trim().toLowerCase();
+  if (
+    !encoding ||
+    !fetchDecodedEncodings.has(encoding) ||
+    fetchSkipsDecoding(requestHeaders)
+  ) return res;
+
+  const headers = new Headers(res.headers);
+  headers.delete("Content-Encoding");
+  headers.delete("Content-Length");
+  return new Response(res.body, {
+    status: res.status,
+    statusText: res.statusText,
+    headers,
+  });
+};
+
 /**
  * Re-streams `res`'s body so that aborting `signal` ends it. Deno serves a body
  * taken straight from `fetch` natively, out of reach of the request's abort, so
@@ -361,7 +401,7 @@ const forwardRequest = async (
       signal,
     });
     return rewriteLocation(
-      endOnAbort(res, signal),
+      endOnAbort(dropDecodedEncoding(res, headers), signal),
       url.origin,
       incoming.origin,
     );

@@ -1,5 +1,6 @@
 import { assertEquals, assertRejects, assertStringIncludes } from "@std/assert";
 import { getAvailablePort } from "@std/net";
+import { brotliCompressSync } from "node:zlib";
 import { createServer, exposeHost, lanUrls } from "./server.ts";
 
 // Keep test output focused on assertions, not the instances' debug logging.
@@ -294,6 +295,125 @@ Deno.test("master: a redirect to a foreign host is left untouched", async () => 
     await upstream.shutdown();
   }
 });
+
+/** CSS an upstream sends encoded; repetitive, so encoding shrinks it well below its length. */
+const css = ":root{--paper:#f3efe6}".repeat(100);
+
+/** `css` run through `CompressionStream` in `format`. */
+const compressCss = async (
+  format: CompressionFormat,
+): Promise<Uint8Array<ArrayBuffer>> =>
+  await new Response(
+    new Blob([css]).stream().pipeThrough(new CompressionStream(format)),
+  ).bytes();
+
+/** `bytes` run through `DecompressionStream` in `format`, as text. */
+const decompress = async (
+  bytes: Uint8Array<ArrayBuffer>,
+  format: CompressionFormat,
+): Promise<string> =>
+  await new Response(
+    new Blob([bytes]).stream().pipeThrough(new DecompressionStream(format)),
+  ).text();
+
+/**
+ * Fetches `/app.css` through the proxy with `headers`, from an upstream that
+ * answers with `encoded` labelled `Content-Encoding: encoding` whatever the
+ * request accepts, like a server sending precompressed assets. Returns the
+ * label and body the client received, after the client's own `fetch` decoding.
+ */
+const proxyEncodedCss = async (
+  encoding: string,
+  encoded: Uint8Array<ArrayBuffer>,
+  headers: HeadersInit,
+): Promise<
+  { contentEncoding: string | null; body: Uint8Array<ArrayBuffer> }
+> => {
+  const port = getAvailablePort()!;
+  const upstreamPort = getAvailablePort()!;
+  const upstream = Deno.serve({
+    port: upstreamPort,
+    onListen: () => {},
+    handler: () =>
+      new Response(encoded, {
+        headers: { "Content-Encoding": encoding, "Content-Type": "text/css" },
+      }),
+  });
+  const server = createServer({ port });
+  try {
+    await server.registerHost("svc", {
+      port: upstreamPort,
+      keepHostname: false,
+    });
+    const res = await fetch(`http://svc.localhost:${port}/app.css`, {
+      headers,
+    });
+    assertEquals(res.status, 200);
+    return {
+      contentEncoding: res.headers.get("Content-Encoding"),
+      body: await res.bytes(),
+    };
+  } finally {
+    await server.close();
+    await upstream.shutdown();
+  }
+};
+
+Deno.test("master: a gzipped upstream response reaches the client intact", async () => {
+  const { body } = await proxyEncodedCss("gzip", await compressCss("gzip"), {
+    "Accept-Encoding": "gzip",
+  });
+  assertEquals(new TextDecoder().decode(body), css);
+});
+
+Deno.test("master: a brotli upstream response reaches the client intact", async () => {
+  const { body } = await proxyEncodedCss(
+    "br",
+    new Uint8Array(brotliCompressSync(css)),
+    { "Accept-Encoding": "br" },
+  );
+  assertEquals(new TextDecoder().decode(body), css);
+});
+
+Deno.test(
+  "master: a response encoded against Accept-Encoding: identity stays labelled",
+  async () => {
+    const { contentEncoding, body } = await proxyEncodedCss(
+      "gzip",
+      await compressCss("gzip"),
+      { "Accept-Encoding": "identity" },
+    );
+    assertEquals(contentEncoding, "gzip");
+    assertEquals(await decompress(body, "gzip"), css);
+  },
+);
+
+Deno.test(
+  "master: an encoded response to a range request stays labelled",
+  async () => {
+    // A range makes `fetch` ask for, and leave alone, the identity coding.
+    const { contentEncoding, body } = await proxyEncodedCss(
+      "gzip",
+      await compressCss("gzip"),
+      { Range: "bytes=0-" },
+    );
+    assertEquals(contentEncoding, "gzip");
+    assertEquals(await decompress(body, "gzip"), css);
+  },
+);
+
+Deno.test(
+  "master: a coding fetch doesn't undo passes through labelled",
+  async () => {
+    const { contentEncoding, body } = await proxyEncodedCss(
+      "deflate",
+      await compressCss("deflate"),
+      { "Accept-Encoding": "deflate" },
+    );
+    assertEquals(contentEncoding, "deflate");
+    assertEquals(await decompress(body, "deflate"), css);
+  },
+);
 
 /** Headers relevant to origin checks, as seen by an upstream behind the proxy. */
 type SeenHeaders = {
